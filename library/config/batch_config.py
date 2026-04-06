@@ -56,6 +56,17 @@ _SCADA_MEASURABLE = {
     "performance_ratio", "pr_deviation", "dc_ac_power_ratio", "power_step",
 }
 
+# Columns that are simulation-only "god-mode" outputs — never available in a
+# real installation and MUST NOT be used as model inputs.
+_GOD_MODE_COLS = {
+    "voc_v",
+    "jsc_a_m2",
+    "ff",
+    "vmpp_v",
+    "jmpp_a_m2",
+    "detailed_balance_efficiency_pct",
+}
+
 
 class BatchConfig:
     """Auto-detected configuration for a SOLEY batch output directory.
@@ -185,6 +196,7 @@ class BatchConfig:
             self.meta_cols | self.label_cols | self.combo_cols
             | self.noise_cols | {"timestamp", "run_id"}
             | {c for c in all_cols if c.endswith("_true")}
+            | _GOD_MODE_COLS          # simulation-only; never available in real installs
         )
         feature_candidates = all_cols - excluded
 
@@ -221,12 +233,18 @@ class BatchConfig:
             log.info("  Estimated array capacity: %.2f kWp (from max DC power)",
                      self.array_kwp)
 
+        god_mode_found = _GOD_MODE_COLS & all_cols
+        if god_mode_found:
+            log.warning(
+                "  God-mode columns found in data and excluded from all feature sets: %s",
+                sorted(god_mode_found),
+            )
         log.info(
             "  Columns: %d SCADA, %d device physics, %d stress, "
-            "%d constant (excluded), %d total features",
+            "%d constant (excluded), %d god-mode (excluded), %d total features",
             len(self.scada_features), len(self.device_features),
             len(self.stress_features), len(constant_cols),
-            len(self.all_feature_cols),
+            len(god_mode_found), len(self.all_feature_cols),
         )
 
     # ------------------------------------------------------------------
