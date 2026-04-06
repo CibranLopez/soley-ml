@@ -77,7 +77,7 @@ def train_model(
     Parameters
     ----------
     model : nn.Module
-        The model to train (created by :func:`~soley_ml.models.build_model`).
+        The model to train (created by :func:`~library.models.build_model`).
     train_loader, val_loader : DataLoader
     device : torch.device
     n_classes : int
@@ -289,7 +289,7 @@ def run_pytorch_task(
     target_col : str
         ``"fault_active"`` or ``"fault_type"``.
     registry : list[dict]
-        From :func:`~soley_ml.data.prepare_file_registry` + assign_splits.
+        From :func:`~library.data.prepare_file_registry` + assign_splits.
     feature_cols : list[str]
     model_modes : list[str]
         Subset of ``["mlp", "lstm", "hybrid"]``.
@@ -308,14 +308,14 @@ def run_pytorch_task(
     import torch
     from torch.utils.data import DataLoader
 
-    from soley_ml.models.dataset import (
+    from library.models.dataset import (
         WindowDataset,
         build_memmap_arrays,
         fit_scaler_streaming,
     )
-    from soley_ml.models.neural_network import build_model
+    from library.models.neural_network import build_model
 
-    from soley_ml.visualization import (
+    from library.visualization import (
         plot_confusion,
         plot_training_curves,
         plot_per_fault_f1,

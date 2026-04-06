@@ -1,5 +1,5 @@
 """
-soley_ml.config.batch_config
+library.config.batch_config
 ============================
 
 Auto-detects everything the ML pipeline needs from a SOLEY batch output

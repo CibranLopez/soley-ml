@@ -44,7 +44,7 @@ def run_temporal_split(
     from sklearn.metrics import classification_report, roc_auc_score
     from sklearn.preprocessing import LabelEncoder
 
-    from soley_ml.visualization import plot_confusion
+    from library.visualization import plot_confusion
 
     log.info("")
     log.info("=" * 65)

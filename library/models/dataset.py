@@ -128,7 +128,7 @@ def build_memmap_arrays(
         Temporary directory containing the memmap files.
         Call ``shutil.rmtree(cache_dir)`` when done.
     """
-    cache_dir = Path(tempfile.mkdtemp(prefix="soley_ml_"))
+    cache_dir = Path(tempfile.mkdtemp(prefix="library_"))
     runs      = []
 
     for i, e in enumerate(entries):

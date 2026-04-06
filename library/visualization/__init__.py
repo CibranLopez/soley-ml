@@ -1,6 +1,6 @@
 """
-soley_ml.visualization
-=======================
+library.visualization
+=====================
 
 Publication-quality plots for fault detection and classification results.
 
@@ -31,7 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-log = logging.getLogger("soley_ml")
+log = logging.getLogger("library")
 
 # Colour palette (consistent across all plots)
 _BLUE   = "#2563eb"
