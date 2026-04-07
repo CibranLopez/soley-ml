@@ -482,8 +482,8 @@ def run_pytorch_task(
             for m, rep in all_reports.items():
                 if cls in rep:
                     row[f"{m}_f1"]        = rep[cls].get("f1-score",  0)
-                    row[f"{m}_precision"]  = rep[cls].get("precision", 0)
-                    row[f"{m}_recall"]     = rep[cls].get("recall",    0)
+                    row[f"{m}_precision"] = rep[cls].get("precision", 0)
+                    row[f"{m}_recall"]    = rep[cls].get("recall",    0)
             rows.append(row)
         csv_path = output_dir / "per_fault_metrics.csv"
         pd.DataFrame(rows).to_csv(csv_path, index=False)
