@@ -10,11 +10,12 @@ Model zoo for solar PV fault detection and classification.
   trainer         — PyTorch training loop and evaluator
 """
 
-from .random_forest import train_rf_detection, train_rf_classification
+from .random_forest import train_rf_detection, train_rf_classification, train_rf_from_registry
 from .neural_network import build_model
 
 __all__ = [
     "train_rf_detection",
     "train_rf_classification",
+    "train_rf_from_registry",
     "build_model",
 ]

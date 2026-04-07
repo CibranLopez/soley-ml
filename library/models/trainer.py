@@ -460,6 +460,7 @@ def run_pytorch_task(
             "class_names":      class_names,
             "feature_names":    available,
             "window_size":      window_size,
+            "stride":           stride,
             "hidden_lstm":      128,
             "hidden_mlp":       64,
             "n_lstm_layers":    2,

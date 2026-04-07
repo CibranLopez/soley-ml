@@ -280,3 +280,223 @@ def train_rf_classification(
         log.info("  Saved deployment model: %s", save_deployment_path)
 
     return model, auc, cv_scores, le
+
+
+# ---------------------------------------------------------------------------
+#  Registry-based training  (unified data pipeline with PyTorch models)
+# ---------------------------------------------------------------------------
+
+def train_rf_from_registry(
+    task_name: str,
+    target_col: str,
+    registry: list[dict],
+    feature_cols: list[str],
+    cfg: BatchConfig,
+    *,
+    n_estimators: int = 200,
+    max_depth: int = 15,
+    min_samples_leaf: int = 20,
+    max_train_rows: int | None = 1_000_000,
+    save_path: Path | None = None,
+    save_deployment_path: Path | None = None,
+    random_state: int = 42,
+) -> tuple:
+    """Train a Random Forest using the same file-level registry splits as
+    the PyTorch pipeline, enabling apples-to-apples model comparison.
+
+    Unlike :func:`train_rf_detection` / :func:`train_rf_classification`, which
+    do a random row-level ``train_test_split`` on the full DataFrame (causing
+    temporal leakage across simulation runs), this function:
+
+    * uses the pre-assigned ``"split"`` key in ``registry`` so that all rows
+      from a given parquet file are exclusively in train **or** test — never
+      both;
+    * is called with the identical registry used by :func:`run_pytorch_task`,
+      so every model family sees the same train / val / test files.
+
+    Parameters
+    ----------
+    task_name : str
+        Human-readable name, e.g. ``"Fault Detection"``.
+    target_col : str
+        ``"fault_active"`` (detection) or ``"fault_type"`` (classification).
+    registry : list[dict]
+        From :func:`~library.data.prepare_file_registry` + ``assign_splits``.
+    feature_cols : list[str]
+    cfg : BatchConfig
+    n_estimators, max_depth, min_samples_leaf : RF hyperparameters
+    max_train_rows : int or None
+        Subsample training rows to manage memory.  ``None`` = no limit.
+    save_path : Path or None
+        Save ``{model, feature_names, class_names, label_encoder}`` with
+        joblib.
+    save_deployment_path : Path or None
+        If given, also save a deployment model trained on SCADA + stress
+        features only (no device physics).
+    random_state : int
+
+    Returns
+    -------
+    model : RandomForestClassifier
+    auc : float or None
+    le : LabelEncoder or None
+    class_names : list[str]
+    """
+    import time
+
+    import pandas as pd
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import classification_report, roc_auc_score
+    from sklearn.preprocessing import LabelEncoder
+
+    from library.features import add_features
+
+    log.info("")
+    log.info("=" * 65)
+    log.info("  RF %s  (registry-based splits)", task_name.upper())
+    log.info("=" * 65)
+
+    is_cls = (target_col == "fault_type")
+
+    train_e = [e for e in registry if e.get("split") == "train"]
+    test_e  = [e for e in registry if e.get("split") == "test"]
+    if is_cls:
+        train_e = [e for e in train_e if e["fault_type"] != "none"]
+        test_e  = [e for e in test_e  if e["fault_type"] != "none"]
+
+    log.info("  Files: train=%d  test=%d", len(train_e), len(test_e))
+
+    def _load(entries: list[dict]) -> pd.DataFrame | None:
+        frames = []
+        for e in entries:
+            df = pd.read_parquet(e["path"], columns=cfg.load_cols)
+            df = add_features(df, cfg.array_kwp)
+            if is_cls and "fault_active" in df.columns:
+                df = df[df["fault_active"]].copy()
+            if len(df):
+                frames.append(df)
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    log.info("  Loading train files …")
+    train_df = _load(train_e)
+    log.info("  Loading test  files …")
+    test_df  = _load(test_e)
+
+    if train_df is None or test_df is None or len(train_df) == 0 or len(test_df) == 0:
+        log.info("  Not enough data — skipping.")
+        return None, None, None, []
+
+    if max_train_rows and len(train_df) > max_train_rows:
+        rng      = np.random.RandomState(random_state)
+        train_df = train_df.sample(n=max_train_rows, random_state=rng)
+        log.info("  Subsampled train to %s rows", f"{len(train_df):,}")
+
+    X_tr, used = build_feature_matrix(train_df, feature_cols)
+    X_te, _    = build_feature_matrix(test_df,  used)
+
+    le = None
+    if is_cls:
+        le = LabelEncoder()
+        y_tr       = le.fit_transform(train_df["fault_type"].values)
+        y_te       = le.transform(test_df["fault_type"].values)
+        class_names = list(le.classes_)
+        log.info("  Classes (%d): %s", len(class_names), class_names)
+    else:
+        y_tr        = train_df["fault_active"].values.astype(int)
+        y_te        = test_df["fault_active"].values.astype(int)
+        class_names = ["Healthy", "Faulted"]
+        n_h = int((y_tr == 0).sum())
+        n_f = int((y_tr == 1).sum())
+        log.info("  Train: %s rows (healthy=%s, faulted=%s)  Test: %s rows",
+                 f"{len(X_tr):,}", f"{n_h:,}", f"{n_f:,}", f"{len(X_te):,}")
+
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        class_weight="balanced",
+        random_state=random_state,
+        n_jobs=-1,
+    )
+
+    log.info("  Training RF (%d trees) …", n_estimators)
+    t0 = time.time()
+    model.fit(X_tr, y_tr)
+    log.info("  Trained in %.1fs", time.time() - t0)
+
+    y_pred = model.predict(X_te)
+    y_prob = model.predict_proba(X_te)
+
+    if is_cls:
+        log.info("")
+        log.info(classification_report(
+            le.inverse_transform(y_te),
+            le.inverse_transform(y_pred),
+        ))
+        try:
+            auc = roc_auc_score(y_te, y_prob, multi_class="ovr", average="weighted")
+        except Exception:
+            auc = None
+    else:
+        log.info("")
+        log.info(classification_report(y_te, y_pred, target_names=class_names))
+        auc = roc_auc_score(y_te, y_prob[:, 1])
+
+    if auc is not None:
+        log.info("  ROC AUC (registry test split): %.4f", auc)
+
+    if save_path is not None:
+        import joblib
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({
+            "model":         model,
+            "feature_names": used,
+            "class_names":   class_names,
+            "label_encoder": le,
+        }, save_path)
+        log.info("  Saved: %s", save_path)
+
+    # Deployment model: SCADA + stress features only (no device physics)
+    if save_deployment_path is not None:
+        eng = ["hour_sin", "hour_cos", "doy_sin", "doy_cos",
+               "performance_ratio", "pr_deviation",
+               "dc_ac_power_ratio", "power_step"]
+        deploy_feats = (list(cfg.scada_features) + eng
+                        + list(cfg.stress_features))
+        deploy_feats = [c for c in deploy_feats if c in train_df.columns]
+
+        X_dep_tr, dep_used = build_feature_matrix(train_df, deploy_feats)
+        X_dep_te, _        = build_feature_matrix(test_df,  dep_used)
+
+        m_dep = RandomForestClassifier(
+            n_estimators=n_estimators, max_depth=max_depth,
+            min_samples_leaf=min_samples_leaf, class_weight="balanced",
+            random_state=random_state, n_jobs=-1,
+        )
+        log.info("  Training deployment model (SCADA+stress only) …")
+        m_dep.fit(X_dep_tr, y_tr)
+
+        try:
+            dep_prob = m_dep.predict_proba(X_dep_te)
+            dep_auc  = (roc_auc_score(y_te, dep_prob[:, 1])
+                        if not is_cls else
+                        roc_auc_score(y_te, dep_prob,
+                                      multi_class="ovr", average="weighted"))
+            log.info("  Deployment AUC: %.4f", dep_auc)
+        except Exception:
+            pass
+
+        import joblib
+        save_deployment_path = Path(save_deployment_path)
+        save_deployment_path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({
+            "model":         m_dep,
+            "feature_names": dep_used,
+            "class_names":   class_names,
+            "label_encoder": le,
+            "note":          "Deployment model: SCADA + stress features only.",
+        }, save_deployment_path)
+        log.info("  Saved deployment model: %s", save_deployment_path)
+
+    return model, auc, le, class_names

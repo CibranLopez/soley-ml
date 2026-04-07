@@ -4,14 +4,17 @@ library.evaluation.ablation
 
 Feature ablation: measure the value of each feature group.
 
-run_feature_ablation(df, output_dir, cfg)
-    Trains four RF detectors on different feature subsets:
+run_feature_ablation(registry, output_dir, cfg)
+    Trains four RF detectors on different feature subsets using the same
+    file-level registry splits as the main training pipeline:
       1. SCADA only
       2. SCADA + stress (deployment-ready)
       3. SCADA + device physics
       4. Full (SCADA + physics + stress)
 
-    Logs AUC deltas, saves the deployment model, and saves a bar chart.
+    Train files → entries with split="train".
+    Test  files → entries with split="test".
+    This gives exactly the same train/test boundary used by all other models.
 """
 
 import logging
@@ -20,72 +23,112 @@ from pathlib import Path
 
 import numpy as np
 
-from library.features import build_feature_matrix
+from library.features import build_feature_matrix, add_features
 
 log = logging.getLogger("library")
 
 
 def run_feature_ablation(
-    df,
+    registry: list[dict],
     output_dir: Path,
     cfg,
     n_estimators: int = 200,
     max_depth: int = 15,
     min_samples_leaf: int = 20,
-    test_size: float = 0.2,
+    max_train_rows: int | None = 600_000,
     random_state: int = 42,
 ) -> list[dict]:
     """Feature ablation study for fault detection.
 
+    Uses **file-level** train/test splits from ``registry`` so that no
+    row from a training run appears in the test set.  This is the same
+    split used by :func:`~library.models.random_forest.train_rf_from_registry`
+    and :func:`~library.models.trainer.run_pytorch_task`.
+
     Parameters
     ----------
-    df : pd.DataFrame
-        Full dataset (daytime, features already engineered).
+    registry : list[dict]
+        From :func:`~library.data.prepare_file_registry` + ``assign_splits``.
+        Each entry must have a ``"split"`` key.
     output_dir : Path
     cfg : BatchConfig
-    (RF hyperparameters)
+    n_estimators, max_depth, min_samples_leaf : RF hyperparameters
+    max_train_rows : int or None
+        Cap on training rows (random subsample).  ``None`` = no limit.
+    random_state : int
 
     Returns
     -------
     list[dict]
-        One entry per feature set:
-        ``{feature_set, n_features, auc}``.
+        One entry per feature set: ``{feature_set, n_features, auc}``.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import pandas as pd
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.metrics import roc_auc_score
-    from sklearn.model_selection import train_test_split
 
     log.info("")
     log.info("=" * 65)
-    log.info("  FEATURE ABLATION")
+    log.info("  FEATURE ABLATION  (registry file-level splits)")
     log.info("=" * 65)
 
-    y        = df["fault_active"].values.astype(int)
-    idx_tr, idx_te = train_test_split(
-        np.arange(len(df)), test_size=test_size,
-        random_state=random_state, stratify=y,
-    )
+    # ---- Load data from registry splits ----------------------------------
+    def _load_entries(entries: list[dict]) -> pd.DataFrame:
+        frames = []
+        for e in entries:
+            df_e = pd.read_parquet(e["path"], columns=cfg.load_cols)
+            df_e = add_features(df_e, cfg.array_kwp)
+            if len(df_e):
+                frames.append(df_e)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
+    train_entries = [e for e in registry if e.get("split") == "train"]
+    test_entries  = [e for e in registry if e.get("split") == "test"]
+    log.info("  Loading train (%d files) …", len(train_entries))
+    train_df = _load_entries(train_entries)
+    log.info("  Loading test  (%d files) …", len(test_entries))
+    test_df  = _load_entries(test_entries)
+
+    if train_df.empty or test_df.empty:
+        log.info("  Not enough data — skipping.")
+        return []
+
+    if max_train_rows and len(train_df) > max_train_rows:
+        rng      = np.random.RandomState(random_state)
+        y_tmp    = train_df["fault_active"].values.astype(int)
+        # Stratified subsample
+        from sklearn.model_selection import train_test_split as _tts
+        idx, _   = _tts(np.arange(len(train_df)), train_size=max_train_rows,
+                        random_state=random_state, stratify=y_tmp)
+        train_df = train_df.iloc[idx].reset_index(drop=True)
+        log.info("  Subsampled train to %s rows", f"{len(train_df):,}")
+
+    y_tr = train_df["fault_active"].values.astype(int)
+    y_te = test_df["fault_active"].values.astype(int)
+
+    log.info("  Train: %s rows  Test: %s rows",
+             f"{len(train_df):,}", f"{len(test_df):,}")
+
+    # ---- Feature subsets -------------------------------------------------
     eng = ["hour_sin", "hour_cos", "doy_sin", "doy_cos",
            "performance_ratio", "pr_deviation", "dc_ac_power_ratio",
            "power_step"]
-    scada_eng   = [c for c in list(cfg.scada_features) + eng
-                   if c in df.columns]
-    scada_str   = [c for c in scada_eng + list(cfg.stress_features)
-                   if c in df.columns]
-    scada_dev   = [c for c in scada_eng + list(cfg.device_features)
-                   if c in df.columns]
-    full        = [c for c in
-                   scada_eng + list(cfg.device_features) + list(cfg.stress_features)
-                   if c in df.columns]
+    scada_eng  = [c for c in list(cfg.scada_features) + eng
+                  if c in train_df.columns]
+    scada_str  = [c for c in scada_eng + list(cfg.stress_features)
+                  if c in train_df.columns]
+    scada_dev  = [c for c in scada_eng + list(cfg.device_features)
+                  if c in train_df.columns]
+    full       = [c for c in
+                  scada_eng + list(cfg.device_features) + list(cfg.stress_features)
+                  if c in train_df.columns]
 
     feature_sets = {
-        "SCADA only":                   scada_eng,
-        "SCADA + stress (deployment)":  scada_str,
-        "SCADA + device physics":       scada_dev,
+        "SCADA only":                      scada_eng,
+        "SCADA + stress (deployment)":     scada_str,
+        "SCADA + device physics":          scada_dev,
         "Full (SCADA + physics + stress)": full,
     }
 
@@ -94,9 +137,8 @@ def run_feature_ablation(
     deployment_feats = None
 
     for set_name, feats in feature_sets.items():
-        X, used = build_feature_matrix(df, feats)
-        X_tr, X_te = X[idx_tr], X[idx_te]
-        y_tr, y_te = y[idx_tr], y[idx_te]
+        X_tr, used = build_feature_matrix(train_df, feats)
+        X_te, _    = build_feature_matrix(test_df,  used)
 
         model = RandomForestClassifier(
             n_estimators=n_estimators, max_depth=max_depth,
