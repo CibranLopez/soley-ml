@@ -276,6 +276,11 @@ def run_pytorch_task(
     patience: int,
     cfg,
     num_workers: int = 0,
+    train_entries: list[dict] | None = None,
+    val_entries: list[dict] | None = None,
+    test_entries: list[dict] | None = None,
+    artifact_prefix: str | None = None,
+    return_details: bool = False,
 ) -> dict:
     """End-to-end PyTorch training pipeline for one task.
 
@@ -301,7 +306,9 @@ def run_pytorch_task(
 
     Returns
     -------
-    dict  — ``{mode: classification_report_dict}`` for each trained model.
+    dict  — ``{mode: classification_report_dict}`` by default.
+    If ``return_details=True``, each value includes the report, AUC,
+    class names, feature names, and saved model path.
     """
     import shutil
 
@@ -325,22 +332,29 @@ def run_pytorch_task(
     from pathlib import Path
 
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     log.info("")
     log.info("=" * 65)
     log.info("  %s", task_name)
     log.info("=" * 65)
 
     is_cls = (target_col == "fault_type")
-    tag    = task_name.lower().replace(" ", "_")
+    tag    = artifact_prefix or task_name.lower().replace(" ", "_")
 
     # Filter registry
-    if is_cls:
-        entries = [e for e in registry
-                   if e["fault_type"] != "none" and "split" in e]
-    else:
-        entries = [e for e in registry if "split" in e]
+    if train_entries is None:
+        train_entries = [e for e in registry if e.get("split") == "train"]
+    if val_entries is None:
+        val_entries = [e for e in registry if e.get("split") == "val"]
+    if test_entries is None:
+        test_entries = [e for e in registry if e.get("split") == "test"]
 
-    if not entries:
+    if is_cls:
+        train_entries = [e for e in train_entries if e["fault_type"] != "none"]
+        val_entries = [e for e in val_entries if e["fault_type"] != "none"]
+        test_entries = [e for e in test_entries if e["fault_type"] != "none"]
+
+    if not train_entries or not test_entries:
         log.info("  No entries — skipping.")
         return {}
 
@@ -349,34 +363,30 @@ def run_pytorch_task(
     if is_cls:
         from sklearn.preprocessing import LabelEncoder
         le = LabelEncoder()
-        le.fit(sorted({e["fault_type"] for e in entries}))
+        le.fit(sorted({e["fault_type"] for e in [*train_entries, *val_entries]}))
         class_names = list(le.classes_)
     else:
         class_names = ["Healthy", "Faulted"]
     n_classes = len(class_names)
 
-    # Split
-    train_e = [e for e in entries if e.get("split") == "train"]
-    val_e   = [e for e in entries if e.get("split") == "val"]
-    test_e  = [e for e in entries if e.get("split") == "test"]
     log.info("  Classes: %d  Files: train=%d, val=%d, test=%d",
-             n_classes, len(train_e), len(val_e), len(test_e))
+             n_classes, len(train_entries), len(val_entries), len(test_entries))
 
     # Scaler
     log.info("  Fitting scaler …")
-    scaler, available = fit_scaler_streaming(train_e, feature_cols, cfg)
+    scaler, available = fit_scaler_streaming(train_entries, feature_cols, cfg)
     n_features = len(available)
 
     # Memmap arrays
-    log.info("  Building train arrays (%d files) …", len(train_e))
+    log.info("  Building train arrays (%d files) …", len(train_entries))
     train_runs, cache_train = build_memmap_arrays(
-        train_e, available, target_col, cfg, scaler, le, is_cls)
-    log.info("  Building val arrays (%d files) …", len(val_e))
+        train_entries, available, target_col, cfg, scaler, le, is_cls)
+    log.info("  Building val arrays (%d files) …", len(val_entries))
     val_runs, cache_val = build_memmap_arrays(
-        val_e, available, target_col, cfg, scaler, le, is_cls)
-    log.info("  Building test arrays (%d files) …", len(test_e))
+        val_entries, available, target_col, cfg, scaler, le, is_cls)
+    log.info("  Building test arrays (%d files) …", len(test_entries))
     test_runs, cache_test = build_memmap_arrays(
-        test_e, available, target_col, cfg, scaler, le, is_cls)
+        test_entries, available, target_col, cfg, scaler, le, is_cls)
 
     # Save preprocessing artifacts
     joblib.dump(scaler, output_dir / f"scaler_{tag}.pkl")
@@ -399,8 +409,8 @@ def run_pytorch_task(
         return {}
 
     if len(val_ds) == 0:
-        log.info("  Warning: no val windows. Using test for validation.")
-        val_ds = test_ds
+        log.info("  Warning: no val windows. Reusing train windows for validation to avoid test leakage.")
+        val_ds = train_ds
 
     use_pin      = device.type == "cuda"
     pw           = num_workers > 0
@@ -418,6 +428,7 @@ def run_pytorch_task(
     class_weights = compute_class_weights(train_runs, n_classes)
 
     all_reports = {}
+    all_details = {}
 
     for mode in model_modes:
         log.info("")
@@ -469,6 +480,13 @@ def run_pytorch_task(
         log.info("  Saved: %s", model_path.name)
 
         all_reports[mode] = report
+        all_details[mode] = {
+            "report": report,
+            "auc": auc,
+            "class_names": class_names,
+            "feature_names": available,
+            "model_path": str(model_path),
+        }
 
     # Per-fault F1 comparison across modes
     if len(all_reports) > 1 and is_cls:
@@ -494,4 +512,4 @@ def run_pytorch_task(
     for cache_dir in [cache_train, cache_val, cache_test]:
         shutil.rmtree(cache_dir, ignore_errors=True)
 
-    return all_reports
+    return all_details if return_details else all_reports

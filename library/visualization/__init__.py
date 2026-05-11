@@ -40,7 +40,12 @@ _AMBER  = "#f59e0b"
 _PURPLE = "#8b5cf6"
 _RED    = "#dc2626"
 
-_MODEL_COLORS = {"mlp": _BLUE, "lstm": _AMBER, "hybrid": _GREEN}
+_MODEL_COLORS = {
+    "mlp": _BLUE,
+    "lstm": _AMBER,
+    "hybrid": _GREEN,
+    "random_forest": _PURPLE,
+}
 
 
 # ---------------------------------------------------------------------------

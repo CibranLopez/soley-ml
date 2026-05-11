@@ -28,7 +28,8 @@ log = logging.getLogger("library")
 # ---------------------------------------------------------------------------
 
 def add_features(df: pd.DataFrame, array_kwp: float | None,
-                 poa_threshold: float = 10.0) -> pd.DataFrame:
+                 poa_threshold: float = 10.0,
+                 lookback_window: int = 12) -> pd.DataFrame:
     """Standard feature engineering pipeline.
 
     Parameters
@@ -43,6 +44,13 @@ def add_features(df: pd.DataFrame, array_kwp: float | None,
     poa_threshold : float
         Minimum plane-of-array irradiance (W/m²) to include a row.
         Rows with POA ≤ threshold are night-time and are dropped.
+    lookback_window : int
+        Number of recent daytime timesteps used for both the rolling
+        PR-deviation baseline and the power-step maximum.  Must be the
+        same value used as ``window_size`` in :class:`~library.models.dataset.WindowDataset`
+        so that both the Random Forest and the LSTM/hybrid architectures
+        see identical historical context.  Default: ``12`` (≈ 1 h at 5-min
+        resolution).
 
     Returns
     -------
@@ -55,11 +63,11 @@ def add_features(df: pd.DataFrame, array_kwp: float | None,
     hour_sin, hour_cos     — cyclical hour-of-day encoding
     doy_sin, doy_cos       — cyclical day-of-year encoding
     performance_ratio      — IEC 61724 PR  (AC output / irradiance-normalised capacity)
-    pr_deviation           — current PR / rolling 7-day mean PR
+    pr_deviation           — current PR / rolling ``lookback_window``-step mean PR
                              (distinguishes soiling from transient clouds)
     dc_ac_power_ratio      — DC / AC power
                              (curtailment: ratio >> 1; MPPT failure: ratio ≈ 1)
-    power_step             — max |ΔPR| over last 12 timesteps (1 h at 5-min)
+    power_step             — max |ΔPR| over last ``lookback_window`` timesteps
                              (cell crack: large step; solder fatigue: no step)
     """
     # --- Daytime filter ---------------------------------------------------
@@ -88,11 +96,10 @@ def add_features(df: pd.DataFrame, array_kwp: float | None,
         ).fillna(0).clip(-100, 100).astype(np.float32)
 
     # --- Rolling PR deviation ---------------------------------------------
-    # Window ≈ 7 days of daytime steps; falls back gracefully for small dfs.
-    pr     = df["performance_ratio"]
-    window = min(500, max(12, len(df) // 100))
-    rolling_mean = pr.rolling(window=window,
-                              min_periods=max(1, window // 4),
+    # Window = lookback_window daytime steps (matches WindowDataset.window_size).
+    pr           = df["performance_ratio"]
+    rolling_mean = pr.rolling(window=lookback_window,
+                              min_periods=max(1, lookback_window // 4),
                               center=False).mean()
     deviation = pr / rolling_mean.replace(0, np.nan)
     df["pr_deviation"] = deviation.fillna(1.0).clip(0, 3).astype(np.float32)
@@ -103,10 +110,10 @@ def add_features(df: pd.DataFrame, array_kwp: float | None,
         df["dc_power_kw"] / ac
     ).fillna(1.0).clip(0, 5).astype(np.float32)
 
-    # --- Power step (max |ΔPR| over 1 h) ----------------------------------
+    # --- Power step (max |ΔPR| over lookback_window steps) ----------------
     pr_diff = pr.diff().abs()
     df["power_step"] = (
-        pr_diff.rolling(window=12, min_periods=1).max()
+        pr_diff.rolling(window=lookback_window, min_periods=1).max()
         .fillna(0).clip(0, 2).astype(np.float32)
     )
 

@@ -42,6 +42,7 @@ def fit_scaler_streaming(
     feature_cols: list[str],
     cfg: BatchConfig,
     n_sample_files: int = 20,
+    lookback_window: int = 12,
 ):
     """Fit a StandardScaler by sampling rows from up to ``n_sample_files`` files.
 
@@ -52,6 +53,11 @@ def fit_scaler_streaming(
     feature_cols : list[str]
     cfg : BatchConfig
     n_sample_files : int
+    lookback_window : int
+        Passed to :func:`~library.features.add_features`.  Must match
+        ``window_size`` used in :class:`WindowDataset` so that feature
+        engineering is consistent between the scaler-fitting step and
+        inference.  Default: ``12``.
 
     Returns
     -------
@@ -69,7 +75,7 @@ def fit_scaler_streaming(
 
     for e in sampled:
         df = pd.read_parquet(e["path"], columns=cfg.load_cols)
-        df = add_features(df, cfg.array_kwp)
+        df = add_features(df, cfg.array_kwp, lookback_window=lookback_window)
         if available is None:
             available = [c for c in feature_cols if c in df.columns]
         n = min(10_000, len(df))
@@ -102,6 +108,7 @@ def build_memmap_arrays(
     scaler,
     label_encoder=None,
     faulted_only: bool = False,
+    lookback_window: int = 12,
 ) -> tuple[list[tuple], Path]:
     """Stream parquet files to disk-backed memmap arrays.
 
@@ -119,6 +126,11 @@ def build_memmap_arrays(
         Required when ``target_col == "fault_type"``.
     faulted_only : bool
         If True, only keep faulted rows (for classification).
+    lookback_window : int
+        Passed to :func:`~library.features.add_features`.  Must match
+        ``window_size`` used in :class:`WindowDataset` so that the rolling
+        features computed here are reproducible at inference time.
+        Default: ``12``.
 
     Returns
     -------
@@ -133,10 +145,17 @@ def build_memmap_arrays(
 
     for i, e in enumerate(entries):
         df = pd.read_parquet(e["path"], columns=cfg.load_cols)
-        df = add_features(df, cfg.array_kwp)
+        df = add_features(df, cfg.array_kwp, lookback_window=lookback_window)
 
         if faulted_only and "fault_active" in df.columns:
             df = df[df["fault_active"]].copy()
+        if target_col != "fault_active" and label_encoder is not None and len(df):
+            known = df["fault_type"].isin(label_encoder.classes_)
+            dropped = int((~known).sum())
+            if dropped:
+                log.info("    Skipping %d rows with unseen fault types in %s",
+                         dropped, e["path"].name)
+            df = df.loc[known].copy()
         if len(df) == 0:
             del df
             continue
@@ -196,6 +215,15 @@ class WindowDataset:
 
     Memmap files are opened lazily and cached with an LRU policy
     to respect OS file-descriptor limits.
+
+    .. note::
+        The ``window_size`` used here **must match** the ``lookback_window``
+        passed to :func:`~library.features.add_features` (via
+        :func:`~library.data.loader.load_data_pt`,
+        :func:`~library.models.dataset.fit_scaler_streaming`, and
+        :func:`~library.models.dataset.build_memmap_arrays`).  Both default
+        to ``12`` so that the Random Forest and sequence models see identical
+        rolling-feature context out of the box.
 
     Parameters
     ----------

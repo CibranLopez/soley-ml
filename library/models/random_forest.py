@@ -27,6 +27,18 @@ from library.features import build_feature_matrix
 log = logging.getLogger("library")
 
 
+def _classification_report_dict(y_true, y_pred, class_names=None):
+    from sklearn.metrics import classification_report
+
+    return classification_report(
+        y_true,
+        y_pred,
+        target_names=class_names,
+        output_dict=True,
+        zero_division=0,
+    )
+
+
 # ---------------------------------------------------------------------------
 #  Detection
 # ---------------------------------------------------------------------------
@@ -300,7 +312,10 @@ def train_rf_from_registry(
     save_path: Path | None = None,
     save_deployment_path: Path | None = None,
     random_state: int = 42,
-) -> tuple:
+    output_dir: Path | None = None,
+    artifact_prefix: str | None = None,
+    return_details: bool = False,
+) -> tuple | dict:
     """Train a Random Forest using the same file-level registry splits as
     the PyTorch pipeline, enabling apples-to-apples model comparison.
 
@@ -398,6 +413,15 @@ def train_rf_from_registry(
     if is_cls:
         le = LabelEncoder()
         y_tr       = le.fit_transform(train_df["fault_type"].values)
+        known_test = test_df["fault_type"].isin(le.classes_)
+        dropped = int((~known_test).sum())
+        if dropped:
+            log.info("  Skipping %d test rows with unseen fault types", dropped)
+        test_df = test_df.loc[known_test].copy()
+        if test_df.empty:
+            log.info("  No known fault types left in test split — skipping.")
+            return {} if return_details else (None, None, None, [])
+        X_te, _    = build_feature_matrix(test_df,  used)
         y_te       = le.transform(test_df["fault_type"].values)
         class_names = list(le.classes_)
         log.info("  Classes (%d): %s", len(class_names), class_names)
@@ -428,22 +452,50 @@ def train_rf_from_registry(
     y_prob = model.predict_proba(X_te)
 
     if is_cls:
+        y_true_out = le.inverse_transform(y_te)
+        y_pred_out = le.inverse_transform(y_pred)
+        report = _classification_report_dict(y_true_out, y_pred_out)
         log.info("")
         log.info(classification_report(
-            le.inverse_transform(y_te),
-            le.inverse_transform(y_pred),
+            y_true_out,
+            y_pred_out,
         ))
         try:
             auc = roc_auc_score(y_te, y_prob, multi_class="ovr", average="weighted")
         except Exception:
             auc = None
     else:
+        y_true_out = y_te
+        y_pred_out = y_pred
+        report = _classification_report_dict(y_true_out, y_pred_out, class_names)
         log.info("")
         log.info(classification_report(y_te, y_pred, target_names=class_names))
         auc = roc_auc_score(y_te, y_prob[:, 1])
 
     if auc is not None:
         log.info("  ROC AUC (registry test split): %.4f", auc)
+
+    if output_dir is not None:
+        from library.visualization import plot_confusion, plot_importance
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tag = artifact_prefix or task_name.lower().replace(" ", "_")
+        plot_confusion(
+            y_true_out,
+            y_pred_out,
+            class_names,
+            f"{task_name} — RANDOM_FOREST",
+            output_dir / f"confusion_{tag}.png",
+        )
+        plot_importance(
+            model,
+            used,
+            f"{task_name} — RANDOM_FOREST",
+            output_dir / f"importance_{tag}.png",
+            scada_features=cfg.scada_features,
+            device_features=cfg.device_features,
+        )
 
     if save_path is not None:
         import joblib
@@ -499,4 +551,135 @@ def train_rf_from_registry(
         }, save_deployment_path)
         log.info("  Saved deployment model: %s", save_deployment_path)
 
+    if return_details:
+        return {
+            "model": model,
+            "report": report,
+            "auc": auc,
+            "label_encoder": le,
+            "class_names": class_names,
+            "feature_names": used,
+            "y_true": y_true_out,
+            "y_pred": y_pred_out,
+            "model_path": str(save_path) if save_path is not None else None,
+        }
+
     return model, auc, le, class_names
+
+
+def run_rf_task(
+    task_name: str,
+    target_col: str,
+    registry: list[dict],
+    feature_cols: list[str],
+    cfg: BatchConfig,
+    *,
+    output_dir: Path,
+    train_entries: list[dict] | None = None,
+    val_entries: list[dict] | None = None,
+    test_entries: list[dict] | None = None,
+    artifact_prefix: str | None = None,
+    n_estimators: int = 200,
+    max_depth: int = 15,
+    min_samples_leaf: int = 20,
+    max_train_rows: int | None = 1_000_000,
+    random_state: int = 42,
+    return_details: bool = False,
+) -> dict:
+    """Unified Random Forest runner matching the notebook-facing API."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if train_entries is None:
+        train_entries = [e for e in registry if e.get("split") == "train"]
+    if val_entries is None:
+        val_entries = [e for e in registry if e.get("split") == "val"]
+    if test_entries is None:
+        test_entries = [e for e in registry if e.get("split") == "test"]
+
+    synthetic_registry = [dict(e, split="train") for e in train_entries]
+    synthetic_registry.extend(dict(e, split="val") for e in val_entries)
+    synthetic_registry.extend(dict(e, split="test") for e in test_entries)
+
+    tag = artifact_prefix or task_name.lower().replace(" ", "_")
+    details = train_rf_from_registry(
+        task_name,
+        target_col,
+        synthetic_registry,
+        feature_cols,
+        cfg,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        max_train_rows=max_train_rows,
+        save_path=output_dir / f"model_{tag}_random_forest.pkl",
+        save_deployment_path=output_dir / f"deployment_{tag}_random_forest.pkl",
+        random_state=random_state,
+        output_dir=output_dir,
+        artifact_prefix=f"{tag}_random_forest",
+        return_details=True,
+    )
+
+    if not details:
+        return {}
+
+    if isinstance(details, tuple):
+        import pandas as pd
+
+        from library.features import add_features
+
+        model, auc, label_encoder, class_names = details
+        if model is None:
+            return {}
+
+        model_path = output_dir / f"model_{tag}_random_forest.pkl"
+        feature_names = list(feature_cols)
+        if model_path.exists():
+            import joblib
+
+            artifact = joblib.load(model_path)
+            model = artifact["model"]
+            feature_names = artifact.get("feature_names", feature_names)
+            class_names = artifact.get("class_names", class_names)
+            label_encoder = artifact.get("label_encoder", label_encoder)
+
+        frames = []
+        for e in test_entries:
+            df = pd.read_parquet(e["path"], columns=cfg.load_cols)
+            df = add_features(df, cfg.array_kwp)
+            if target_col == "fault_type":
+                df = df[df["fault_active"]].copy()
+                if label_encoder is not None:
+                    df = df[df["fault_type"].isin(label_encoder.classes_)].copy()
+            if len(df):
+                frames.append(df)
+
+        test_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if test_df.empty:
+            return {}
+
+        X_te, _ = build_feature_matrix(test_df, feature_names)
+        if target_col == "fault_type":
+            y_true_idx = label_encoder.transform(test_df["fault_type"].values)
+            y_pred_idx = model.predict(X_te)
+            y_true = label_encoder.inverse_transform(y_true_idx)
+            y_pred = label_encoder.inverse_transform(y_pred_idx)
+            report = _classification_report_dict(y_true, y_pred)
+        else:
+            y_true = test_df["fault_active"].values.astype(int)
+            y_pred = model.predict(X_te)
+            report = _classification_report_dict(y_true, y_pred, class_names)
+
+        details = {
+            "model": model,
+            "report": report,
+            "auc": auc,
+            "label_encoder": label_encoder,
+            "class_names": class_names,
+            "feature_names": feature_names,
+            "y_true": y_true,
+            "y_pred": y_pred,
+            "model_path": str(model_path) if model_path.exists() else None,
+        }
+
+    return {"random_forest": details if return_details else details["report"]}
