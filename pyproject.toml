@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soley-ml"
+dynamic = ["version"]
+description = "Solar PV fault detection and classification utilities"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "SOLEY Team" }
+]
+keywords = ["solar", "photovoltaic", "fault-detection", "machine-learning"]
+license = "LicenseRef-Proprietary"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+  "matplotlib==3.10.8",
+  "numpy==2.4.4",
+  "pandas==3.0.2",
+  "pillow==12.2.0",
+  "pyarrow==23.0.1",
+  "scikit-learn==1.8.0",
+  "scipy==1.17.1",
+  "seaborn==0.13.2",
+  "torch==2.11.0",
+  "torchvision==0.26.0"
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "library.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["library*"]
+exclude = ["data*", "outputs*"]
