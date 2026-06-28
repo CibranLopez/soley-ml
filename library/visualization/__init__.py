@@ -21,6 +21,12 @@ plot_ablation(ablation_results, path)
 
 plot_cross_location(results, path)
     Side-by-side bar charts for detection and classification AUC per site.
+
+plot_shap_summary(values, feature_values, feature_names, title, path, method)
+    Horizontal bar chart of mean(|attribution|) per feature.
+    Accepts SHAP values (tabular) or Captum attributions (sequence models)
+    — both collapse to the same (n_samples, n_features) shape before this
+    function is called, so a single renderer covers both cases.
 """
 
 import logging
@@ -242,7 +248,7 @@ def plot_per_fault_f1(
 
 
 # ---------------------------------------------------------------------------
-#  Ablation bar chart  (standalone — evaluation/ablation.py also draws one)
+#  Ablation bar chart
 # ---------------------------------------------------------------------------
 
 def plot_ablation(ablation_results: list[dict], path: Path) -> None:
@@ -272,7 +278,7 @@ def plot_ablation(ablation_results: list[dict], path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Cross-location bar chart  (standalone version)
+#  Cross-location bar chart
 # ---------------------------------------------------------------------------
 
 def plot_cross_location(results: list[dict], path: Path) -> None:
@@ -311,6 +317,98 @@ def plot_cross_location(results: list[dict], path: Path) -> None:
     log.info("  Saved %s", Path(path).name)
 
 
+# ---------------------------------------------------------------------------
+#  SHAP / attribution summary  (Task C — tabular + sequence models)
+# ---------------------------------------------------------------------------
+
+def plot_shap_summary(
+    values: np.ndarray,
+    feature_values: np.ndarray | None,
+    feature_names: list[str] | None,
+    title: str,
+    path: Path,
+    method: str = "shap",
+    top_n: int = 20,
+) -> None:
+    """Horizontal bar chart of mean(|attribution|) per feature.
+
+    A single renderer for both SHAP values (tabular models via
+    ``shap.TreeExplainer`` / ``shap.LinearExplainer``) and gradient-based
+    attributions (PyTorch sequence models via Captum
+    ``IntegratedGradients``). Both sources collapse to the same
+    ``(n_samples, n_features)`` shape before calling this function, so
+    the plot logic is identical regardless of model family.
+
+    Follows the same conventions as the rest of this module: matplotlib
+    Agg backend, save to a ``Path``, ``log.info`` on completion.
+    Complements (does not replace) ``plot_importance``: importance shows
+    the model's global learned weights; this shows which features actually
+    drove the model's predictions on the held-out test set.
+
+    Parameters
+    ----------
+    values : np.ndarray, shape (n_samples, n_features)
+        SHAP values or attribution scores. Already collapsed to 2-D:
+        binary classifiers → positive/faulted class only;
+        multi-class → mean(|.|) across classes;
+        sequence models → mean over the time/window dimension.
+    feature_values : np.ndarray, shape (n_samples, n_features) or None
+        The underlying feature values the attributions correspond to.
+        Currently unused in the bar-chart rendering but kept in the
+        signature for future beeswarm-style dot plots.
+    feature_names : list[str] or None
+        If None, features are labelled f0, f1, …
+    title : str
+    path : Path
+    method : str
+        Attribution method label shown in the x-axis and plot title so
+        readers know what they're looking at: ``"shap"`` (TreeExplainer /
+        LinearExplainer), ``"integrated_gradients"`` (Captum IG), etc.
+    top_n : int
+        Number of top features (by mean |attribution|) to display.
+    """
+    values = np.asarray(values)
+    if values.ndim != 2:
+        log.info(
+            "  plot_shap_summary: expected 2-D array, got shape %s — "
+            "skipping plot for %s", values.shape, Path(path).name
+        )
+        return
+
+    n_features   = values.shape[1]
+    names        = (feature_names if feature_names is not None
+                    else [f"f{i}" for i in range(n_features)])
+    mean_abs     = np.abs(values).mean(axis=0)   # (n_features,)
+    top_n        = min(top_n, n_features)
+    order        = np.argsort(mean_abs)[-top_n:]  # ascending → bottom of chart
+
+    fig, ax = plt.subplots(figsize=(9, max(5, top_n * 0.38)))
+
+    # Colour-code by sign of the mean attribution so the chart is
+    # informative even without a beeswarm: positive mean → blue (fault
+    # indicator), negative mean → red (healthy indicator).
+    mean_signed  = values.mean(axis=0)
+    bar_colors   = [_BLUE if mean_signed[i] >= 0 else _RED for i in order]
+
+    ax.barh(range(len(order)), mean_abs[order], color=bar_colors)
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels([names[i] for i in order], fontsize=10)
+    ax.set_xlabel(f"mean(|{method} attribution|)", fontsize=11)
+    ax.set_title(
+        f"{title}\n"
+        f"(blue = pushes toward fault, red = pushes toward healthy)",
+        fontsize=12,
+    )
+    ax.grid(True, axis="x", alpha=0.3)
+    plt.tight_layout()
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info("  Saved %s", path.name)
+
+
 __all__ = [
     "plot_confusion",
     "plot_importance",
@@ -318,4 +416,5 @@ __all__ = [
     "plot_per_fault_f1",
     "plot_ablation",
     "plot_cross_location",
+    "plot_shap_summary",
 ]

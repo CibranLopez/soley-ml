@@ -105,7 +105,24 @@ def run_temporal_split(
     custom_runners: dict[str, callable] | None = None,
     random_state: int = 42,
 ) -> dict:
-    """Train on early years and evaluate on the last year for each model mode."""
+    """Train on early sim years and evaluate on the final sim year.
+
+    Temporal split design for multi-year parquet files
+    ---------------------------------------------------
+    Each SOLEY parquet file can span multiple sim_year values (e.g. years
+    1–6 representing 2018–2023 in a single run file).  Reading only the
+    first row to discover a file's year — as the naive implementation did —
+    always returns year 1 for every file, collapsing all files into one
+    year bucket and making the split impossible.
+
+    The fix: read all unique ``sim_year`` values from every file to build
+    a global year set, then build year-filtered entry dicts
+    (``{"path": ..., "sim_year_filter": [1,2,3,4]}`` for training,
+    ``{"path": ..., "sim_year_filter": [6]}`` for testing).  The tabular
+    loader (``_load_train_test_from_registry``) and the PyTorch loader
+    both recognise the ``sim_year_filter`` key and filter rows accordingly,
+    so no data is physically duplicated and no new files need to be created.
+    """
     model_modes = model_modes or ["random_forest"]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -119,23 +136,51 @@ def run_temporal_split(
     log.info("  TEMPORAL SPLIT (all model modes)")
     log.info("=" * 65)
 
-    year_map: dict[str, int] = {}
+    # --- Discover ALL sim_years per file, not just row 0 ------------------
+    # Row 0 is always the earliest timestamp (year 1) in a multi-year file,
+    # so reading .iloc[0] would assign every file to year 1 and make the
+    # split degenerate.  We read the full sim_year column (cheap — one int
+    # column) and collect unique values instead.
+    log.info("  Discovering sim_year range per file …")
+    file_years: dict[str, set[int]] = {}   # path → set of years in that file
     for e in entries:
         try:
-            sim_year = pd.read_parquet(e["path"], columns=["sim_year"]).iloc[0]["sim_year"]
-            year_map[str(e["path"])] = int(sim_year)
+            ys = pd.read_parquet(e["path"], columns=["sim_year"])["sim_year"].unique()
+            file_years[str(e["path"])] = {int(y) for y in ys}
         except Exception:
             pass
 
-    years = sorted(set(year_map.values()))
-    if len(years) < 2:
-        log.info("  Not enough years for temporal evaluation.")
+    if not file_years:
+        log.info("  sim_year column missing in registry files — skipping.")
         return {}
 
-    test_year = years[-1]
-    train_pool = [e for e in entries if year_map.get(str(e["path"])) in set(years[:-1])]
-    test_entries = [e for e in entries if year_map.get(str(e["path"])) == test_year]
+    all_years = sorted(set.union(*file_years.values()))
+    log.info("  sim_years found across all files: %s", all_years)
+
+    if len(all_years) < 2:
+        log.info("  Only %d sim_year value(s) found — need ≥ 2 for a "
+                 "temporal split — skipping.", len(all_years))
+        return {}
+
+    test_year   = all_years[-1]
+    train_years = set(all_years[:-1])
+    log.info("  Train years: %s  |  Test year: %d",
+             sorted(train_years), test_year)
+
+    # --- Build year-filtered entries --------------------------------------
+    # Each entry dict gets a "sim_year_filter" key; the tabular loader
+    # applies it as a row-level filter after reading the parquet file.
+    # This means every file contributes rows to BOTH the train and test
+    # split (filtered to different year ranges), which is the correct
+    # behaviour when files span multiple years.
+    train_pool    = [dict(e, sim_year_filter=sorted(train_years)) for e in entries]
+    test_entries  = [dict(e, sim_year_filter=[test_year])         for e in entries]
+
+    # Internal train/val split for early-stopping in sequence models
     train_entries, val_entries = _clone_with_splits(train_pool, seed=random_state)
+
+    log.info("  train_entries=%d  val_entries=%d  test_entries=%d",
+             len(train_entries), len(val_entries), len(test_entries))
 
     results = _run_dual_tasks(
         registry=registry,

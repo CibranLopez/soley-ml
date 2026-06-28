@@ -211,7 +211,8 @@ def evaluate_model(
     auc : float or None  ROC-AUC (binary: standard; multi-class: OvR weighted)
     """
     import torch
-    from sklearn.metrics import classification_report, roc_auc_score
+
+    from library.evaluation.metrics import classification_metrics
 
     model.eval()
     all_preds, all_labels, all_probs = [], [], []
@@ -230,31 +231,101 @@ def evaluate_model(
     y_true = np.concatenate(all_labels)
     y_prob = np.concatenate(all_probs)
 
-    report = classification_report(
-        y_true, y_pred,
-        target_names=class_names,
-        output_dict=True,
-        zero_division=0,
+    metrics = classification_metrics(
+        y_true, y_pred, y_prob, class_names=class_names,
     )
-    report_str = classification_report(
-        y_true, y_pred,
-        target_names=class_names,
-        zero_division=0,
-    )
-    log.info("")
-    log.info(report_str)
-
-    try:
-        if y_prob.shape[1] == 2:
-            auc = roc_auc_score(y_true, y_prob[:, 1])
-        else:
-            auc = roc_auc_score(y_true, y_prob,
-                                multi_class="ovr", average="weighted")
-        log.info("  ROC AUC: %.4f", auc)
-    except Exception:
-        auc = None
+    report = metrics["report"]
+    auc    = metrics["auc"]
 
     return y_true, y_pred, y_prob, report, auc
+
+
+# ---------------------------------------------------------------------------
+#  Gradient-based attribution — opt-in, degrades gracefully (Task C)
+# ---------------------------------------------------------------------------
+
+def _maybe_plot_attribution(
+    model,
+    test_loader,
+    feature_names: list[str],
+    title: str,
+    path,
+    device,
+    max_samples: int = 256,
+) -> None:
+    """Opt-in explainability for the PyTorch sequence models (mlp/lstm/hybrid).
+
+    ``shap.DeepExplainer`` can be unreliable with recurrent layers
+    depending on the installed SHAP/PyTorch version combination (its
+    hooks into LSTM internals are fragile across versions). We use
+    Captum's ``IntegratedGradients`` instead: it's maintained directly by
+    the PyTorch team, works against arbitrary ``nn.Module`` graphs with no
+    special-casing for LSTM, and its attributions are axiomatically
+    grounded (completeness: attributions sum to the prediction delta from
+    a zero baseline) rather than approximated via sampling like
+    ``GradientExplainer``.
+
+    Scoped to a representative sample of windows (``max_samples``), not
+    the full test set — integrated gradients needs multiple forward+
+    backward passes per sample (``n_steps``), so it isn't cheap.
+
+    Attributions are averaged over the time/window dimension before
+    plotting, collapsing ``(n_samples, window, n_features)`` down to
+    ``(n_samples, n_features)`` — the same shape the tabular SHAP path
+    produces — so a single ``plot_shap_summary`` can render both.
+
+    Degrades gracefully (logs and returns) if ``captum`` isn't installed
+    or if ``library.visualization.plot_shap_summary`` isn't available yet,
+    rather than failing the training run — this is opt-in instrumentation.
+    """
+    try:
+        from captum.attr import IntegratedGradients
+    except ImportError:
+        log.info("  (captum not installed — skipping gradient attribution; "
+                 "`pip install captum` to enable)")
+        return
+
+    import torch
+
+    model.eval()
+    xs, ys, n_collected = [], [], 0
+    for x_batch, y_batch in test_loader:
+        xs.append(x_batch)
+        ys.append(y_batch)
+        n_collected += x_batch.shape[0]
+        if n_collected >= max_samples:
+            break
+    if not xs:
+        log.info("  (no test windows available — skipping attribution)")
+        return
+
+    x_sample = torch.cat(xs, dim=0)[:max_samples].to(device)
+    y_sample = torch.cat(ys, dim=0)[:max_samples].to(device)
+    baseline = torch.zeros_like(x_sample)
+
+    ig = IntegratedGradients(model)
+    try:
+        attributions = ig.attribute(
+            x_sample, baselines=baseline, target=y_sample, n_steps=32,
+        )
+    except Exception as exc:
+        log.info("  Integrated-gradients attribution failed (%s) — skipping.", exc)
+        return
+
+    # (n_samples, window, n_features) -> (n_samples, n_features)
+    attr_by_feature = attributions.detach().cpu().numpy().mean(axis=1)
+    x_by_feature    = x_sample.detach().cpu().numpy().mean(axis=1)
+
+    try:
+        from library.visualization import plot_shap_summary
+    except ImportError:
+        log.info("  (library.visualization.plot_shap_summary not available "
+                 "yet — skipping attribution plot; computed attributions "
+                 "but had nowhere to render them)")
+        return
+
+    plot_shap_summary(attr_by_feature, x_by_feature, feature_names, title, path,
+                      method="integrated_gradients")
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +351,9 @@ def run_pytorch_task(
     val_entries: list[dict] | None = None,
     test_entries: list[dict] | None = None,
     artifact_prefix: str | None = None,
+    compute_shap: bool = False,
+    shap_sample_size: int = 256,
+    lookback_window: int = 12,
     return_details: bool = False,
 ) -> dict:
     """End-to-end PyTorch training pipeline for one task.
@@ -303,6 +377,13 @@ def run_pytorch_task(
     output_dir : Path
     cfg : BatchConfig
     num_workers : int
+    compute_shap : bool
+        Opt-in gradient-based attribution plot (Captum IntegratedGradients)
+        per mode — see :func:`_maybe_plot_attribution`. Off by default
+        since it adds extra forward/backward passes per fitted model.
+    shap_sample_size : int
+        Number of test windows to run attribution over (not the full test
+        set — see :func:`_maybe_plot_attribution`).
 
     Returns
     -------
@@ -374,19 +455,23 @@ def run_pytorch_task(
 
     # Scaler
     log.info("  Fitting scaler …")
-    scaler, available = fit_scaler_streaming(train_entries, feature_cols, cfg)
+    scaler, available = fit_scaler_streaming(
+        train_entries, feature_cols, cfg, lookback_window=lookback_window)
     n_features = len(available)
 
     # Memmap arrays
     log.info("  Building train arrays (%d files) …", len(train_entries))
     train_runs, cache_train = build_memmap_arrays(
-        train_entries, available, target_col, cfg, scaler, le, is_cls)
+        train_entries, available, target_col, cfg, scaler, le, is_cls,
+        lookback_window=lookback_window)
     log.info("  Building val arrays (%d files) …", len(val_entries))
     val_runs, cache_val = build_memmap_arrays(
-        val_entries, available, target_col, cfg, scaler, le, is_cls)
+        val_entries, available, target_col, cfg, scaler, le, is_cls,
+        lookback_window=lookback_window)
     log.info("  Building test arrays (%d files) …", len(test_entries))
     test_runs, cache_test = build_memmap_arrays(
-        test_entries, available, target_col, cfg, scaler, le, is_cls)
+        test_entries, available, target_col, cfg, scaler, le, is_cls,
+        lookback_window=lookback_window)
 
     # Save preprocessing artifacts
     joblib.dump(scaler, output_dir / f"scaler_{tag}.pkl")
@@ -460,6 +545,14 @@ def run_pytorch_task(
             f"{task_name} — {mode.upper()}",
             output_dir / f"confusion_{tag}_{mode}.png",
         )
+
+        if compute_shap:
+            _maybe_plot_attribution(
+                model, test_loader, available,
+                f"{task_name} — {mode.upper()} — Attribution",
+                output_dir / f"shap_{tag}_{mode}.png",
+                device, max_samples=shap_sample_size,
+            )
 
         # Save model checkpoint
         model_path = output_dir / f"model_{tag}_{mode}.pt"

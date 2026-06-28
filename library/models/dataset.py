@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 
 from library.config import BatchConfig
-from library.features import add_features
 
 log = logging.getLogger("library")
 
@@ -67,6 +66,8 @@ def fit_scaler_streaming(
     """
     from sklearn.preprocessing import StandardScaler
 
+    from library.data.loader import load_registry_entry  # single canonical reader
+
     step    = max(1, len(entries) // n_sample_files)
     sampled = entries[::step][:n_sample_files]
 
@@ -74,8 +75,7 @@ def fit_scaler_streaming(
     available = None
 
     for e in sampled:
-        df = pd.read_parquet(e["path"], columns=cfg.load_cols)
-        df = add_features(df, cfg.array_kwp, lookback_window=lookback_window)
+        df = load_registry_entry(e, cfg, lookback_window=lookback_window)
         if available is None:
             available = [c for c in feature_cols if c in df.columns]
         n = min(10_000, len(df))
@@ -143,9 +143,10 @@ def build_memmap_arrays(
     cache_dir = Path(tempfile.mkdtemp(prefix="library_"))
     runs      = []
 
+    from library.data.loader import load_registry_entry  # single canonical reader
+
     for i, e in enumerate(entries):
-        df = pd.read_parquet(e["path"], columns=cfg.load_cols)
-        df = add_features(df, cfg.array_kwp, lookback_window=lookback_window)
+        df = load_registry_entry(e, cfg, lookback_window=lookback_window)
 
         if faulted_only and "fault_active" in df.columns:
             df = df[df["fault_active"]].copy()

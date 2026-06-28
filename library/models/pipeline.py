@@ -38,6 +38,7 @@ def run_model_task(
     test_entries: list[dict] | None = None,
     artifact_prefix: str | None = None,
     rf_params: dict | None = None,
+    lookback_window: int = 12,
     custom_runners: dict[str, callable] | None = None,
     return_details: bool = False,
 ) -> dict:
@@ -45,6 +46,14 @@ def run_model_task(
 
     Parameters mirror the existing PyTorch and Random Forest runners, but the
     notebook only needs one call site regardless of model family.
+
+    Parameters
+    ----------
+    lookback_window : int
+        Rolling-feature window forwarded unchanged to every backend so that
+        :func:`~library.data.load_registry_entry` (and therefore
+        :func:`~library.features.add_features`) uses the same value for
+        every model family — RF, MLP, LSTM, and Hybrid.  Default ``12``.
     """
     from .random_forest import run_rf_task
     from .trainer import run_pytorch_task
@@ -95,6 +104,7 @@ def run_model_task(
             val_entries=val_entries,
             test_entries=test_entries,
             artifact_prefix=artifact_prefix,
+            lookback_window=lookback_window,
             return_details=return_details,
         ))
 
@@ -110,6 +120,7 @@ def run_model_task(
             val_entries=val_entries,
             test_entries=test_entries,
             artifact_prefix=artifact_prefix,
+            lookback_window=lookback_window,
             return_details=return_details,
             **rf_params,
         ))
