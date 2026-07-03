@@ -22,7 +22,6 @@ import json
 import logging
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 log = logging.getLogger("library")
@@ -42,6 +41,18 @@ _COMBO_PREFIX   = "combo_"
 _STRESS_PREFIX  = "stress_"
 _NOISE_COLS     = {"noise_applied", "is_dropout", "timestamp_true"}
 
+# Engineered features derived solely from SCADA signals (added by
+# add_features(), never present as raw parquet columns). Defined once here
+# and referenced both by _SCADA_MEASURABLE (so a column of this name is
+# classified as SCADA-derived if it were ever found in raw data) and by
+# feature_set() (to build the "scada" feature list) — previously this list
+# was duplicated verbatim in both places, risking drift if a new engineered
+# feature were ever added to only one of them.
+_ENGINEERED_FEATURES = (
+    "hour_sin", "hour_cos", "doy_sin", "doy_cos",
+    "performance_ratio", "pr_deviation", "dc_ac_power_ratio", "power_step",
+)
+
 # Columns that a real SCADA / monitoring system can measure directly.
 # Everything else is a "device physics" column (simulation-only).
 _SCADA_MEASURABLE = {
@@ -51,10 +62,7 @@ _SCADA_MEASURABLE = {
     "precipitation_mm",
     "dc_power_kw", "ac_power_kw",
     "solar_elevation_deg", "aoi_deg",
-    # Engineered features derived solely from SCADA signals:
-    "hour_sin", "hour_cos", "doy_sin", "doy_cos",
-    "performance_ratio", "pr_deviation", "dc_ac_power_ratio", "power_step",
-}
+} | set(_ENGINEERED_FEATURES)
 
 # Columns that are simulation-only "god-mode" outputs — never available in a
 # real installation and MUST NOT be used as model inputs.
@@ -272,9 +280,7 @@ class BatchConfig:
         ----------
         mode : {"full", "scada", "scada+stress", "scada+device"}
         """
-        eng = ["hour_sin", "hour_cos", "doy_sin", "doy_cos",
-               "performance_ratio", "pr_deviation", "dc_ac_power_ratio",
-               "power_step"]
+        eng = list(_ENGINEERED_FEATURES)
         scada = list(self.scada_features) + eng
 
         if mode == "scada":
