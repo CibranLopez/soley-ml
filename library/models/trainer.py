@@ -695,6 +695,7 @@ def _run_sequence_modes(
     lookback_window: int,
     compute_shap: bool,
     shap_sample_size: int,
+    random_state: int,
     return_details: bool,
 ) -> dict:
     """Fit every requested sequence architecture against one shared scaler
@@ -703,8 +704,19 @@ def _run_sequence_modes(
     this function now *receives* its LabelEncoder from :func:`run_task`
     instead of fitting its own, guaranteeing it agrees with whatever the
     tabular family in the same call used).
+
+    ``random_state`` seeds ``torch``/``numpy``/``random`` immediately before
+    building and training each mode. Previously only the tabular family had
+    any reproducibility guarantee (via sklearn's own ``random_state``); the
+    sequence family had none — weight initialisation and DataLoader
+    shuffling were both unseeded, so training ``mlp`` twice with identical
+    data and hyperparameters produced different metrics each run. Seeding
+    per-mode (not once for the whole function) also makes each mode's
+    result independent of what order it was trained in within the same
+    call.
     """
     import shutil
+    import random
     from pathlib import Path
 
     import joblib
@@ -717,11 +729,7 @@ def _run_sequence_modes(
         fit_scaler_streaming,
     )
     from library.models.definitions import build_model
-    from library.visualization import (
-        plot_confusion,
-        plot_per_fault_f1,
-        plot_training_curves,
-    )
+    from library.visualization import plot_confusion, plot_training_curves
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -779,9 +787,24 @@ def _run_sequence_modes(
 
     use_pin = device.type == "cuda"
     pw      = num_workers > 0
+    # drop_last=True on the TRAIN loader only: nn.BatchNorm1d (used in the
+    # MLP branch of every sequence architecture) raises ValueError if a
+    # training-mode forward pass ever sees a batch of exactly 1 sample
+    # ("Expected more than 1 value per channel when training") — which
+    # happens whenever total_train_windows % batch_size == 1, entirely by
+    # chance, and would otherwise crash training partway through an epoch
+    # with no partial-result recovery. Guarded to only apply when there's
+    # more than one full batch of data, so a small dataset doesn't end up
+    # silently training on zero batches instead of raising or crashing.
+    train_drop_last = len(train_ds) > batch_size
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=use_pin,
-                              persistent_workers=pw)
+                              persistent_workers=pw, drop_last=train_drop_last)
+    # val/test are evaluated in model.eval() mode, where BatchNorm uses its
+    # stored running statistics rather than the current batch's — so a
+    # batch of size 1 is never a problem here. drop_last stays False (the
+    # default) so every val/test window is always evaluated; dropping the
+    # last partial batch here would silently shrink the reported test set.
     val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                               num_workers=num_workers, pin_memory=use_pin,
                               persistent_workers=pw)
@@ -792,11 +815,21 @@ def _run_sequence_modes(
     class_weights = compute_class_weights(train_runs, n_classes)
 
     all_details: dict = {}
-    all_reports: dict = {}
 
     for mode in modes:
         log.info("")
         log.info("  — Model: %s —", mode.upper())
+
+        # Reproducibility: seed immediately before building/training this
+        # mode so its weight init and DataLoader shuffling are deterministic
+        # given random_state, matching the guarantee the tabular family
+        # already has via sklearn's own random_state. Re-seeding per mode
+        # (not once for the whole function) also means training "lstm"
+        # alone gives the same result whether or not "mlp" ran first in the
+        # same call.
+        torch.manual_seed(random_state)
+        np.random.seed(random_state)
+        random.seed(random_state)
 
         model = build_model(mode, n_features=n_features, n_classes=n_classes,
                             hidden_lstm=128, hidden_mlp=64,
@@ -851,7 +884,6 @@ def _run_sequence_modes(
         }, model_path)
         log.info("  Saved: %s", model_path.name)
 
-        all_reports[mode] = report
         all_details[mode] = {
             "model":         model,
             "report":        report,
@@ -863,23 +895,6 @@ def _run_sequence_modes(
             "y_pred":        y_pred_out,
             "model_path":    str(model_path),
         }
-
-    if len(all_reports) > 1 and is_cls:
-        plot_per_fault_f1(all_reports, class_names,
-                          output_dir / f"per_fault_f1_{tag}.png")
-        import pandas as pd
-        rows = []
-        for cls in class_names:
-            row = {"fault_type": cls}
-            for m, rep in all_reports.items():
-                if cls in rep:
-                    row[f"{m}_f1"]        = rep[cls].get("f1-score",  0)
-                    row[f"{m}_precision"] = rep[cls].get("precision", 0)
-                    row[f"{m}_recall"]    = rep[cls].get("recall",    0)
-            rows.append(row)
-        csv_path = output_dir / "per_fault_metrics.csv"
-        pd.DataFrame(rows).to_csv(csv_path, index=False)
-        log.info("  Saved %s", csv_path.name)
 
     for cache_dir in (cache_train, cache_val, cache_test):
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -1123,7 +1138,7 @@ def run_task(
             le, class_names, output_dir, artifact_prefix,
             window_size, stride, batch_size, epochs, device, patience,
             num_workers, lookback_window, compute_shap, shap_sample_size,
-            return_details,
+            random_state, return_details,
         ))
 
     # --- 5. Custom runners (extension point) ----------------------------------
@@ -1150,6 +1165,59 @@ def run_task(
             results.update(custom_result)
         else:
             results[mode] = custom_result
+
+    # --- 6. Cross-family per-fault F1 comparison (every requested mode) ------
+    # Deliberately placed here, not inside _run_tabular_modes /
+    # _run_sequence_modes: this is the one place with visibility into every
+    # family's results at once. Previously this comparison lived only inside
+    # the sequence-model path, so a call mixing tabular and sequence modes —
+    # exactly what 02_unified_model_training.ipynb's MODEL_MODES does for
+    # every study (main training, temporal split, cross-location, ablation)
+    # — silently produced a plot/CSV that only ever showed mlp/lstm/hybrid,
+    # never random_forest, even though random_forest's own report was
+    # computed and returned correctly elsewhere. Building it here from the
+    # combined `results` dict means it reflects everything actually trained.
+    if is_cls and len(results) > 1:
+        from library.visualization import plot_per_fault_f1
+
+        reports_by_mode = {}
+        for mode, value in results.items():
+            report = value.get("report") if isinstance(value, dict) and "report" in value else value
+            # Defensive: only include modes whose result actually looks like
+            # a classification_report dict (class-name keys mapping to
+            # {precision, recall, f1-score, ...} sub-dicts). A custom_runners
+            # entry might not have this shape — skip it here rather than
+            # crash the whole comparison over one differently-shaped mode.
+            if isinstance(report, dict) and any(
+                isinstance(v, dict) and "f1-score" in v for v in report.values()
+            ):
+                reports_by_mode[mode] = report
+
+        if len(reports_by_mode) > 1:
+            tag = artifact_prefix or task_name.lower().replace(" ", "_")
+            plot_per_fault_f1(reports_by_mode, class_names,
+                              output_dir / f"per_fault_f1_{tag}.png")
+
+            rows = []
+            for cls in class_names:
+                row = {"fault_type": cls}
+                for m, rep in reports_by_mode.items():
+                    if cls in rep:
+                        row[f"{m}_f1"]        = rep[cls].get("f1-score",  0)
+                        row[f"{m}_precision"] = rep[cls].get("precision", 0)
+                        row[f"{m}_recall"]    = rep[cls].get("recall",    0)
+                rows.append(row)
+
+            import pandas as pd
+            # Tag included in the filename — unlike the pre-fix version,
+            # which used a fixed "per_fault_metrics.csv" name that silently
+            # overwrote itself across repeated run_task calls with different
+            # artifact_prefix (e.g. once per fold in run_cross_location, or
+            # once per feature set in run_feature_ablation).
+            csv_path = output_dir / f"per_fault_metrics_{tag}.csv"
+            pd.DataFrame(rows).to_csv(csv_path, index=False)
+            log.info("  Saved %s (%d model(s) compared)",
+                     csv_path.name, len(reports_by_mode))
 
     return results
 

@@ -43,9 +43,26 @@ def classification_metrics(
     y_pred = np.asarray(y_pred)
     y_prob = np.asarray(y_prob)
 
+    # Explicit labels=range(len(class_names)) is required, not optional:
+    # without it, classification_report infers its label set from whatever
+    # is actually present in y_true/y_pred for THIS call. If a specific
+    # fold's test data doesn't cover every class the shared LabelEncoder
+    # knows about — plausible whenever this is called per-site (cross-
+    # location) or per-year (temporal split), where one site/year may
+    # simply not contain every fault type — that inferred set is smaller
+    # than class_names, and classification_report raises an uncaught
+    # ValueError ("Number of classes, N, does not match size of
+    # target_names, M"), crashing the whole run_task call rather than
+    # just this one metric. Passing labels= explicitly makes the label set
+    # always the full vocabulary; a class absent from this fold correctly
+    # shows up as a zero-support row (zero_division=0 handles the
+    # resulting 0/0 precision/recall) instead of raising.
+    labels = range(len(class_names)) if class_names is not None else None
+
     acc = accuracy_score(y_true, y_pred)
     rep = classification_report(
         y_true, y_pred,
+        labels=labels,
         target_names=class_names,
         output_dict=True,
         zero_division=0,
@@ -55,6 +72,7 @@ def classification_metrics(
         log.info("  %s", task)
     log.info(
         classification_report(y_true, y_pred,
+                              labels=labels,
                               target_names=class_names, zero_division=0)
     )
 

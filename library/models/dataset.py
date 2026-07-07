@@ -250,14 +250,41 @@ class WindowDataset:
         self._cumulative = []   # cumulative window count before this run
         self._total      = 0
 
+        n_dropped_runs = 0
+        n_dropped_rows = 0
+
         for run_idx, (fp, fs, lp, ls, rid) in enumerate(run_arrays):
             n = fs[0]
             if n < window_size:
+                n_dropped_runs += 1
+                n_dropped_rows += n
                 continue
             n_windows = (n - window_size) // stride + 1
             self._run_info.append((run_idx, n_windows))
             self._cumulative.append(self._total)
             self._total += n_windows
+
+        if n_dropped_runs:
+            # Previously silent: a run shorter than window_size contributes
+            # ZERO windows to this dataset, and therefore is entirely absent
+            # from sequence-model training/evaluation — while the same run
+            # would still fully contribute its rows to the tabular (Random
+            # Forest) side, which has no minimum-length requirement. At the
+            # real production WINDOW_SIZE (2016 = 7 days at 5-min cadence,
+            # see 02_unified_model_training.ipynb), short simulation runs
+            # are a real, not just theoretical, way for this to happen.
+            # Logging it here means the disparity is visible instead of a
+            # silent difference in what each model family effectively saw.
+            total_rows = sum(fs[0] for _fp, fs, _lp, _ls, _rid in run_arrays)
+            log.info(
+                "  WindowDataset: dropped %d/%d run(s) shorter than "
+                "window_size=%d (%s/%s rows, %.1f%% of this split) — these "
+                "contribute ZERO windows here but still fully count toward "
+                "tabular (Random Forest) training/evaluation.",
+                n_dropped_runs, len(run_arrays), window_size,
+                f"{n_dropped_rows:,}", f"{total_rows:,}",
+                100.0 * n_dropped_rows / max(total_rows, 1),
+            )
 
         self._cache       = {}
         self._cache_order = []

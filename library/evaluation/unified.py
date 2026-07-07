@@ -278,12 +278,22 @@ def run_cross_location(
         )
         site_name = cfg.get_location_name(*[float(x) for x in test_loc.split("_")])
         for mode, metrics in metrics_by_mode.items():
+            # metrics.get(key, np.nan) is NOT sufficient here: it only
+            # substitutes np.nan when the key is entirely absent, not when
+            # the key is present but its value is an explicit None — which
+            # is exactly what classification_metrics() stores when AUC
+            # computation fails (e.g. a fold whose test data is degenerate
+            # for classification). An explicit None previously slipped
+            # through into plot_cross_location's ax.bar() call, which
+            # crashed (matplotlib can plot NaN as a gap, but not None).
+            det_auc = metrics.get("detection_auc")
+            cls_auc = metrics.get("classification_auc")
             rows.append({
                 "model_mode": mode,
                 "test_location": site_name,
                 "test_loc_id": test_loc,
-                "detection_auc": metrics.get("detection_auc", np.nan),
-                "classification_auc": metrics.get("classification_auc", np.nan),
+                "detection_auc": det_auc if det_auc is not None else np.nan,
+                "classification_auc": cls_auc if cls_auc is not None else np.nan,
             })
 
     for mode in sorted({row["model_mode"] for row in rows}):
@@ -352,11 +362,18 @@ def run_feature_ablation(
             return_details=True,
         )
         for mode, meta in details.items():
+            # meta.get("auc") can be an explicit None (classification_metrics
+            # stores None when AUC computation itself fails, e.g. a
+            # degenerate test fold with only one class present) — substitute
+            # np.nan so this can't reach plot_ablation's min(aucs) call
+            # un-guarded, matching the fix applied to run_cross_location for
+            # the identical root cause.
+            auc_val = meta.get("auc")
             rows.append({
                 "model_mode": mode,
                 "feature_set": set_name,
                 "n_features": len(feats),
-                "auc": meta.get("auc"),
+                "auc": auc_val if auc_val is not None else np.nan,
             })
 
     for mode in sorted({row["model_mode"] for row in rows}):

@@ -133,7 +133,6 @@ def plot_importance(
     top_n       = min(top_n, len(feature_names))
     indices     = np.argsort(importances)[-top_n:]
 
-    scada_set  = set(scada_features  or [])
     device_set = set(device_features or [])
 
     colors = []
@@ -252,10 +251,22 @@ def plot_per_fault_f1(
 # ---------------------------------------------------------------------------
 
 def plot_ablation(ablation_results: list[dict], path: Path) -> None:
-    """Bar chart of AUC across feature subsets."""
+    """Bar chart of AUC across feature subsets.
+
+    Defensively treats a missing/None AUC (``classification_metrics``
+    stores ``None`` when AUC computation itself fails — e.g. a degenerate
+    test fold with only one class present) as ``np.nan`` rather than
+    letting it reach ``min()``/bar-height arithmetic un-guarded, which
+    would raise ``TypeError``. This is defense-in-depth alongside the fix
+    in ``unified.py``'s ``run_feature_ablation`` (which now substitutes
+    ``np.nan`` before this function is ever called) — hardening the
+    plotting function itself means it can't be broken again by some other,
+    future caller making the same mistake.
+    """
     fig, ax = plt.subplots(figsize=(12, 5))
     names  = [r["feature_set"] for r in ablation_results]
-    aucs   = [r["auc"]         for r in ablation_results]
+    aucs   = [(r["auc"] if r["auc"] is not None else np.nan)
+              for r in ablation_results]
     colors = [_BLUE, _AMBER, _GREEN, _PURPLE]
 
     bars = ax.bar(range(len(ablation_results)), aucs,
@@ -264,12 +275,14 @@ def plot_ablation(ablation_results: list[dict], path: Path) -> None:
     ax.set_xticklabels(names, fontsize=10, rotation=5, ha="center")
     ax.set_ylabel("ROC AUC", fontsize=12)
     ax.set_title("Feature Ablation — SOLEY Physics vs. SCADA Only", fontsize=13)
-    min_auc = min(aucs)
+    finite_aucs = [a for a in aucs if not np.isnan(a)]
+    min_auc = min(finite_aucs) if finite_aucs else 0.0
     ax.set_ylim(max(0, min_auc - 0.05), 1.02)
     for bar, v, n in zip(bars, aucs, [r["n_features"] for r in ablation_results]):
-        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.005,
-                f"AUC={v:.4f}\n({n} feat.)",
-                ha="center", fontsize=10, fontweight="bold")
+        label = f"AUC={v:.4f}\n({n} feat.)" if not np.isnan(v) else f"AUC=N/A\n({n} feat.)"
+        y_pos = (v if not np.isnan(v) else 0) + 0.005
+        ax.text(bar.get_x() + bar.get_width() / 2, y_pos,
+                label, ha="center", fontsize=10, fontweight="bold")
 
     plt.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -282,7 +295,15 @@ def plot_ablation(ablation_results: list[dict], path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def plot_cross_location(results: list[dict], path: Path) -> None:
-    """Side-by-side detection / classification AUC bars per test site."""
+    """Side-by-side detection / classification AUC bars per test site.
+
+    Defensively treats a missing/None AUC as ``np.nan`` before plotting —
+    see the docstring note in :func:`plot_ablation` for why this same
+    guard is needed here. Without it, a single fold where AUC computation
+    failed (e.g. a location whose test data happened to be degenerate for
+    classification — too few classes present) would crash the entire
+    chart via ``ax.bar()``'s internal arithmetic on a Python ``None``.
+    """
     if not results:
         return
 
@@ -296,7 +317,7 @@ def plot_cross_location(results: list[dict], path: Path) -> None:
         (axes[1], "classification_auc", _GREEN,
          "Cross-Location Classification"),
     ]:
-        vals = [r[key] for r in results]
+        vals = [(r[key] if r[key] is not None else np.nan) for r in results]
         bars = ax.bar(x, vals, color=color, width=0.6)
         ax.set_xticks(list(x))
         ax.set_xticklabels(names, fontsize=10, rotation=15, ha="right")
