@@ -55,101 +55,38 @@ def run_model_task(
         :func:`~library.features.add_features`) uses the same value for
         every model family — RF, MLP, LSTM, and Hybrid.  Default ``12``.
     """
-    from .random_forest import run_rf_task
-    from .trainer import run_pytorch_task
+    from .trainer import run_task
 
-    rf_params = rf_params or {}
-    custom_runners = custom_runners or {}
+    # Backward-compatibility: preserve the old rf_params argument by mapping
+    # it to the new per-mode tabular kwargs API.
+    tabular_kwargs = None
+    if rf_params:
+        tabular_kwargs = {"random_forest": dict(rf_params)}
 
-    sequence_modes = [m for m in model_modes if m in SEQUENCE_MODEL_MODES]
-    tabular_modes = [m for m in model_modes if m in TABULAR_MODEL_MODES]
-    custom_modes = [m for m in model_modes
-                    if m not in SEQUENCE_MODEL_MODES | TABULAR_MODEL_MODES]
-
-    results = {}
-
-    if sequence_modes:
-        missing = [
-            name for name, value in {
-                "window_size": window_size,
-                "stride": stride,
-                "batch_size": batch_size,
-                "epochs": epochs,
-                "device": device,
-                "patience": patience,
-            }.items()
-            if value is None
-        ]
-        if missing:
-            raise ValueError(
-                "Sequence modes require these parameters: " + ", ".join(missing)
-            )
-
-        results.update(run_pytorch_task(
-            task_name=task_name,
-            target_col=target_col,
-            registry=registry,
-            feature_cols=feature_cols,
-            model_modes=sequence_modes,
-            window_size=window_size,
-            stride=stride,
-            batch_size=batch_size,
-            epochs=epochs,
-            device=device,
-            output_dir=output_dir,
-            patience=patience,
-            cfg=cfg,
-            num_workers=num_workers,
-            train_entries=train_entries,
-            val_entries=val_entries,
-            test_entries=test_entries,
-            artifact_prefix=artifact_prefix,
-            lookback_window=lookback_window,
-            return_details=return_details,
-        ))
-
-    if tabular_modes:
-        results.update(run_rf_task(
-            task_name=task_name,
-            target_col=target_col,
-            registry=registry,
-            feature_cols=feature_cols,
-            cfg=cfg,
-            output_dir=output_dir,
-            train_entries=train_entries,
-            val_entries=val_entries,
-            test_entries=test_entries,
-            artifact_prefix=artifact_prefix,
-            lookback_window=lookback_window,
-            return_details=return_details,
-            **rf_params,
-        ))
-
-    for mode in custom_modes:
-        runner = custom_runners.get(mode)
-        if runner is None:
-            log.info("  Skipping unsupported model mode: %s", mode)
-            continue
-
-        custom_result = runner(
-            task_name=task_name,
-            target_col=target_col,
-            registry=registry,
-            feature_cols=feature_cols,
-            output_dir=output_dir,
-            cfg=cfg,
-            train_entries=train_entries,
-            val_entries=val_entries,
-            test_entries=test_entries,
-            artifact_prefix=artifact_prefix,
-            return_details=return_details,
-        )
-        if isinstance(custom_result, dict) and mode in custom_result:
-            results.update(custom_result)
-        else:
-            results[mode] = custom_result
-
-    return results
+    return run_task(
+        task_name=task_name,
+        target_col=target_col,
+        registry=registry,
+        feature_cols=feature_cols,
+        model_modes=model_modes,
+        output_dir=output_dir,
+        cfg=cfg,
+        window_size=window_size,
+        stride=stride,
+        batch_size=batch_size,
+        epochs=epochs,
+        device=device,
+        patience=patience,
+        num_workers=num_workers,
+        train_entries=train_entries,
+        val_entries=val_entries,
+        test_entries=test_entries,
+        artifact_prefix=artifact_prefix,
+        tabular_kwargs=tabular_kwargs,
+        lookback_window=lookback_window,
+        custom_runners=custom_runners,
+        return_details=return_details,
+    )
 
 
 __all__ = ["run_model_task", "SEQUENCE_MODEL_MODES", "TABULAR_MODEL_MODES"]

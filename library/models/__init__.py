@@ -4,26 +4,20 @@ library.models
 
 Model zoo for solar PV fault detection and classification.
 
-  random_forest   — scikit-learn RandomForestClassifier wrappers
-  neural_network  — PyTorch MLP / LSTM / Hybrid architecture
-  dataset         — WindowDataset and streaming memmap builder
-  trainer         — PyTorch training loop and evaluator
+  definitions  — model builders and mode registries
+  dataset      — WindowDataset and streaming memmap builder
+  trainer      — unified tabular + sequence training/evaluation
+  pipeline     — notebook-facing convenience wrapper
 """
 
 from .pipeline import run_model_task
-from .random_forest import (
-  run_rf_task,
-  train_rf_classification,
-  train_rf_detection,
-  train_rf_from_registry,
-)
-from .neural_network import build_model
+from .trainer import run_task
+from .definitions import build_model, TABULAR_ESTIMATORS, SEQUENCE_MODES
 
 __all__ = [
-  "run_model_task",
-  "run_rf_task",
-    "train_rf_detection",
-    "train_rf_classification",
-    "train_rf_from_registry",
+    "run_model_task",
+    "run_task",
     "build_model",
+    "TABULAR_ESTIMATORS",
+    "SEQUENCE_MODES",
 ]
