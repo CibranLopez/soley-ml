@@ -151,13 +151,58 @@ class BatchConfig:
                 self.locations[(lat, lon)] = short_name
 
             self.config = cfg
-            log.info("  Config: array=%.2f kWp, %d location(s)",
+            log.info("  Config: array=%.2f kWp, %d location(s) from batch_config.json",
                      self.array_kwp or 0, len(self.locations))
         else:
             log.info("  No batch_config.json — using auto-detection.")
             self.array_kwp = None
             self.locations = {}
             self.config    = {}
+ 
+        # Fallback: discover locations directly from the parquet files'
+        # own latitude/longitude columns whenever batch_config.json didn't
+        # provide any — whether because it's absent entirely, or present
+        # but structured differently than the sweep_summary.locations[]
+        # schema above expects. array_kwp already has an equivalent
+        # fallback (estimated from dc_power_kw in _discover_columns);
+        # locations previously had none.
+        if not self.locations:
+            discovered = self._discover_locations_from_parquet()
+            if discovered:
+                self.locations = discovered
+                log.info("  Discovered %d location(s) directly from parquet "
+                         "latitude/longitude columns (batch_config.json "
+                         "provided none).", len(self.locations))
+
+    def _discover_locations_from_parquet(self) -> dict[tuple, str]:
+        """Discover unique (lat, lon) pairs by reading them directly from
+        every parquet file in the batch.
+
+        Fallback source of truth for locations, used whenever
+        ``batch_config.json`` is missing or doesn't yield anything under
+        its expected schema. Reads only the two coordinate columns from
+        one row of each file — cheap even across many files, since
+        parquet's columnar layout means this never touches feature data.
+
+        Returns
+        -------
+        dict[tuple[float, float], str]
+            Same shape as the JSON-derived ``self.locations``: keys are
+            ``(round(lat, 2), round(lon, 2))``. Values fall back to a
+            ``"{lat}_{lon}"`` string since no human-readable place name is
+            available from the parquet data alone.
+        """
+        files = sorted(self.data_dir.glob("*.parquet"))
+        discovered: dict[tuple, str] = {}
+        for f in files:
+            try:
+                row = pd.read_parquet(f, columns=["latitude", "longitude"]).iloc[0]
+            except Exception:
+                continue
+            lat = round(float(row["latitude"]), 2)
+            lon = round(float(row["longitude"]), 2)
+            discovered.setdefault((lat, lon), f"{lat}_{lon}")
+        return discovered
 
     # ------------------------------------------------------------------
     #  Step 2: discover and categorise columns from parquet schema
