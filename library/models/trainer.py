@@ -571,11 +571,13 @@ def _run_tabular_modes(
     output_dir,
     artifact_prefix: str | None,
     lookback_window: int,
-    max_train_rows: int | None,
+    max_train_rows: int | str | None,
     random_state: int,
     tabular_kwargs: dict[str, dict] | None,
     save_deployment: bool,
     return_details: bool,
+    max_test_rows: int | str | None = 1_000_000,
+    majority_thin_factor: int = 1,
 ) -> dict:
     """Fit every requested tabular estimator against one shared data load.
 
@@ -589,6 +591,36 @@ def _run_tabular_modes(
     a fresh ``random_state``-seeded sample inside the single RF-only
     trainer; with only one tabular mode that was harmless, but it wasn't
     structurally guaranteed to stay that way).
+
+    Memory fix
+    ----------
+    Both loads now pass ``max_rows`` straight through to
+    :func:`~library.data.loader.load_split`, which bounds peak memory to
+    a small multiple of the cap *during* the load (see that function's
+    docstring) rather than materializing every train/test file in full
+    first and only subsampling afterward. Previously this call site
+    passed no ``max_rows`` to either ``load_split`` invocation at all:
+    ``max_train_rows`` was applied to ``train_df`` only *after* the full,
+    unbounded train load had already completed, and ``test_df`` had no
+    cap under any circumstances — every test file was always fully
+    loaded. With a large registry (``MAX_RUNS=None``) and this helper
+    invoked repeatedly (main detection/classification tasks, plus once
+    per fold in ``run_temporal_split``/``run_cross_location``/
+    ``run_feature_ablation``), that unbounded test load was the primary
+    source of repeated out-of-memory crashes.
+
+    majority_thin_factor : int
+        Forwarded to the *train* :func:`~library.data.loader.load_split`
+        call only — keeps roughly ``1 / majority_thin_factor`` of each
+        training file's majority-``fault_active`` rows (whichever value
+        is more common *in that file* — this is decided per file, not
+        assumed to always be the healthy side; batches where faults
+        dominate the row count are not unusual), every minority row
+        untouched. Default ``1`` (no thinning), matching ``load_split``'s
+        own default so this is a strict opt-in. Deliberately never
+        applied to ``test_df``: thinning the evaluation set would bias
+        reported precision/recall/AUC away from the true healthy/faulted
+        ratio, which defeats the point of holding out a test set at all.
     """
     from library.data.loader import load_split, stratified_subsample
     from library.features import build_feature_matrix
@@ -599,9 +631,14 @@ def _run_tabular_modes(
     log.info("=" * 65)
 
     log.info("  Loading train files …")
-    train_df = load_split(train_entries, cfg, lookback_window=lookback_window)
+    train_df = load_split(train_entries, cfg, max_rows=max_train_rows,
+                          lookback_window=lookback_window, random_state=random_state,
+                          majority_thin_factor=majority_thin_factor)
     log.info("  Loading test  files …")
-    test_df  = load_split(test_entries,  cfg, lookback_window=lookback_window)
+    # No majority_thin_factor here — the test split must stay at its true,
+    # untouched healthy/faulted ratio (see docstring above).
+    test_df  = load_split(test_entries,  cfg, max_rows=max_test_rows,
+                          lookback_window=lookback_window, random_state=random_state)
 
     if is_cls:
         if "fault_active" in train_df.columns:
@@ -631,7 +668,18 @@ def _run_tabular_modes(
     # Uses the same stratified_subsample() helper load_split() itself uses,
     # rather than a second, independently-maintained copy of the same
     # try/except-ValueError-fallback logic.
-    if max_train_rows and len(train_df) > max_train_rows:
+    #
+    # Only meaningful when max_train_rows is an actual int: load_split()
+    # already enforces max_train_rows as a cap *during* its own load for
+    # every accepted value ("auto", an int, or None), stratified by
+    # fault_type — so len(train_df) can't exceed a resolved int cap by the
+    # time we get here regardless. This block additionally re-stratifies
+    # by fault_active specifically for the detection task (is_cls=False),
+    # which load_split's own internal cap doesn't do. It has nothing to
+    # check against "auto" (not a number to compare len() to — that's what
+    # crashed here) or None (no cap requested), so it's skipped for both;
+    # load_split's own capping already applied in those cases.
+    if isinstance(max_train_rows, int) and len(train_df) > max_train_rows:
         strat_col = "fault_type" if is_cls else "fault_active"
         train_df = stratified_subsample(train_df, max_train_rows, strat_col,
                                         random_state)
@@ -867,6 +915,27 @@ def _run_sequence_modes(
                 device, max_samples=shap_sample_size,
             )
 
+        # Release this mode's GPU memory before the next mode starts.
+        # `all_details[mode]["model"]` below keeps a live reference to the
+        # trained model (callers need it for later inspection/saving), and
+        # `train_model` leaves it sitting on `device` — so across this
+        # mlp -> lstm -> hybrid loop, every earlier mode's weights/buffers
+        # stayed resident on the GPU for the rest of the run, never freed.
+        # At WINDOW_SIZE=2016 with BATCH_SIZE=512, that's a lot of held
+        # memory doing nothing useful by the time the largest architecture
+        # (hybrid = MLP branch + LSTM branch) starts training, and it's
+        # squarely the kind of thing that can turn a later mode's backward
+        # pass into a genuine CUDA out-of-memory. On some driver/NVML setups
+        # PyTorch's allocator can't even report that OOM cleanly — it tries
+        # to query NVML for a friendlier message and, if NVML itself fails
+        # to init in this environment, you get an opaque
+        # "NVML_SUCCESS == ... INTERNAL ASSERT FAILED" instead of a plain
+        # "CUDA out of memory". Moving each finished model to CPU and
+        # clearing the allocator's cache here removes that accumulation.
+        if device.type == "cuda":
+            model = model.cpu()
+            torch.cuda.empty_cache()
+
         model_path = output_dir / f"model_{tag}_{mode}.pt"
         torch.save({
             "model_state_dict": model.state_dict(),
@@ -926,7 +995,9 @@ def run_task(
     val_entries: list[dict] | None = None,
     test_entries: list[dict] | None = None,
     artifact_prefix: str | None = None,
-    max_train_rows: int | None = 1_000_000,
+    max_train_rows: int | str | None = 1_000_000,
+    max_test_rows: int | str | None = 1_000_000,
+    majority_thin_factor: int = 1,
     random_state: int = 42,
     tabular_kwargs: dict[str, dict] | None = None,
     save_deployment: bool = True,
@@ -994,11 +1065,53 @@ def run_task(
         Required if any sequence mode is requested; ignored otherwise.
     device : torch.device or None
         Required if any sequence mode is requested.
-    max_train_rows : int or None
+    max_train_rows : int, "auto", or None
         Cap on tabular training rows, applied once and shared by every
         tabular mode in this call (stratified by the target column where
-        possible). ``None`` disables subsampling. Has no effect on
-        sequence modes, which consume full per-file windows.
+        possible). ``"auto"`` sizes the cap from currently available
+        system memory instead of a fixed number — the safest choice when
+        you don't already know how much data safely fits, since it can't
+        under- or over-shoot a hand-picked constant as the machine or
+        dataset size changes. ``None`` disables subsampling entirely
+        (loads every row) and is the one setting that can still OOM on a
+        large registry — it logs a preflight warning with the computed
+        safe cap first, but honours the request regardless. Has no effect
+        on sequence modes, which consume full per-file windows. This cap
+        is enforced *during* the load (passed straight into
+        :func:`~library.data.loader.load_split`), not just after — so
+        peak memory while loading train files is bounded by this value
+        rather than by the full training-split file size.
+    max_test_rows : int, "auto", or None
+        Same as ``max_train_rows`` but for the tabular test set. Default
+        ``1_000_000`` — previously the test load had no cap at all, so
+        the entire test split was always fully materialized in memory
+        regardless of ``max_train_rows``, which was the main source of
+        repeated out-of-memory crashes across the main tasks and every
+        fold of ``run_temporal_split`` / ``run_cross_location`` /
+        ``run_feature_ablation``. Set to ``None`` to restore the old
+        unbounded behaviour if you specifically need every test row in
+        memory at once (e.g. for a metric that can't be computed on a
+        subsample) — but prefer ``"auto"`` over ``None`` if the only goal
+        is "use as much as safely fits."
+    majority_thin_factor : int
+        Tabular-only redundancy reduction: keeps roughly
+        ``1 / majority_thin_factor`` of each *training* file's
+        majority-``fault_active`` rows (whichever value — ``True`` or
+        ``False`` — is more common in that file; decided per file, not
+        assumed to always be the healthy side) before the row cap and
+        stratified subsample above are applied; every minority-class row
+        is always kept. Default ``1`` — no thinning, identical behaviour
+        to before this parameter existed. Never applied to the test
+        split (evaluation must see the true healthy/faulted ratio) and
+        has no effect on sequence modes (``mlp``/``lstm``/``hybrid``),
+        which need contiguous per-file timesteps for windowing and would
+        have their temporal structure corrupted by thinning. Pick a
+        value from the actual measured ratio in your data (e.g. a batch
+        that's 80% one class and 20% the other → a factor around 4 lands
+        near 1:1); pushing well past that starts manufacturing a new
+        imbalance in the other direction rather than just trimming
+        redundancy. Watch the "Train: N rows" log line after enabling it
+        to see the effect.
     random_state : int
         Seed for the shared tabular subsample and the default
         ``random_state`` of any tabular estimator that doesn't override it
@@ -1111,7 +1224,8 @@ def run_task(
             train_entries, val_entries, test_entries, feature_cols, cfg,
             le, class_names, output_dir, artifact_prefix, lookback_window,
             max_train_rows, random_state, tabular_kwargs, save_deployment,
-            return_details,
+            return_details, max_test_rows=max_test_rows,
+            majority_thin_factor=majority_thin_factor,
         ))
 
     # --- 4. Sequence family ---------------------------------------------------
