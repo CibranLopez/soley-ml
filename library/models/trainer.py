@@ -436,7 +436,14 @@ def _fit_eval_save_tabular(
     save_deployment: bool = True,
     **estimator_kwargs,
 ) -> dict | None:
-    """Fit, evaluate, plot, and save one tabular estimator.
+    """Fit, evaluate, plot, and save one tabular estimator in a single shot.
+
+    Requires the entire ``X_tr``/``y_tr`` training matrix in memory at once
+    — this is what :func:`_fit_eval_save_tabular_batched` exists to avoid
+    for datasets too large to hold in memory simultaneously. The fit step
+    is factored out into this function's body; evaluation/plotting/saving
+    is shared with the batched path via :func:`_eval_save_tabular` so the
+    two paths can't silently diverge in how a model is scored or persisted.
 
     Returns ``None`` (and logs why) if the estimator's factory needs an
     optional dependency that isn't installed — this lets a multi-mode
@@ -445,9 +452,7 @@ def _fit_eval_save_tabular(
     """
     import time
 
-    from library.evaluation.metrics import classification_metrics
     from library.models.definitions import build_model
-    from library.visualization import plot_confusion, plot_importance
 
     try:
         model = build_model(mode, **estimator_kwargs)
@@ -460,6 +465,61 @@ def _fit_eval_save_tabular(
     t0 = time.time()
     model.fit(X_tr, y_tr)
     log.info("  Trained in %.1fs", time.time() - t0)
+
+    # Deployment variant: same estimator family, SCADA + stress features
+    # only (works on real SCADA data — no SOLEY-simulation-only physics).
+    # Generalised from the original RF-only logic: works for whichever
+    # `mode` was requested, since it goes through the same build_model().
+    # Uses cfg.feature_set("scada+stress") — the same authoritative method
+    # the notebooks use to build feature lists — rather than a hand-rolled
+    # copy of the engineered-feature names, so this can't drift out of
+    # sync with BatchConfig if a new engineered feature is ever added.
+    dep_model = None
+    deploy_feats: list[str] = []
+    if save_deployment:
+        deploy_set = set(cfg.feature_set("scada+stress"))
+        deploy_idx = [i for i, f in enumerate(feature_names) if f in deploy_set]
+        if deploy_idx:
+            deploy_feats = [feature_names[i] for i in deploy_idx]
+            try:
+                dep_model = build_model(mode, **estimator_kwargs)
+            except ImportError:
+                dep_model = None
+            if dep_model is not None:
+                log.info("  Training deployment model (SCADA+stress only) …")
+                dep_model.fit(X_tr[:, deploy_idx], y_tr)
+
+    return _eval_save_tabular(
+        mode, task_name, model, dep_model, X_te, y_te, feature_names,
+        deploy_feats, is_cls, le, class_names, output_dir, tag_base, cfg,
+    )
+
+
+def _eval_save_tabular(
+    mode: str,
+    task_name: str,
+    model,
+    dep_model,
+    X_te, y_te,
+    feature_names: list[str],
+    deploy_feats: list[str],
+    is_cls: bool,
+    le,
+    class_names: list[str],
+    output_dir,
+    tag_base: str,
+    cfg,
+) -> dict:
+    """Evaluate, plot, and save an already-fitted tabular estimator (and its
+    optional already-fitted deployment variant).
+
+    Factored out of :func:`_fit_eval_save_tabular` so both the single-shot
+    fit path and the batched fit path (:func:`_fit_eval_save_tabular_batched`)
+    score and persist a model identically — the two paths differ only in
+    HOW the model got fitted, never in how it's evaluated or saved.
+    """
+    from library.evaluation.metrics import classification_metrics
+    from library.visualization import plot_confusion, plot_importance
 
     y_pred = model.predict(X_te)
     y_prob = model.predict_proba(X_te)
@@ -494,54 +554,36 @@ def _fit_eval_save_tabular(
     }, model_path)
     log.info("  Saved: %s", model_path.name)
 
-    # Deployment variant: same estimator family, SCADA + stress features
-    # only (works on real SCADA data — no SOLEY-simulation-only physics).
-    # Generalised from the original RF-only logic: works for whichever
-    # `mode` was requested, since it goes through the same build_model().
-    # Uses cfg.feature_set("scada+stress") — the same authoritative method
-    # the notebooks use to build feature lists — rather than a hand-rolled
-    # copy of the engineered-feature names, so this can't drift out of
-    # sync with BatchConfig if a new engineered feature is ever added.
-    if save_deployment:
-        deploy_set = set(cfg.feature_set("scada+stress"))
-        deploy_idx = [i for i, f in enumerate(feature_names) if f in deploy_set]
-        if deploy_idx:
-            deploy_feats = [feature_names[i] for i in deploy_idx]
-            try:
-                dep_model = build_model(mode, **estimator_kwargs)
-            except ImportError:
-                dep_model = None
-            if dep_model is not None:
-                log.info("  Training deployment model (SCADA+stress only) …")
-                dep_model.fit(X_tr[:, deploy_idx], y_tr)
-                # Reuse the same classification_metrics() helper the primary
-                # model uses above, rather than re-deriving AUC inline. The
-                # two must agree on binary-vs-multiclass handling — that
-                # helper branches on the *actual* y_prob column count, which
-                # is the correct signal (a classification task can still
-                # have exactly 2 classes in a given split, in which case the
-                # binary path is right even though is_cls=True for the task
-                # as a whole).
-                try:
-                    dep_prob = dep_model.predict_proba(X_te[:, deploy_idx])
-                    dep_metrics = classification_metrics(
-                        y_te, dep_model.predict(X_te[:, deploy_idx]), dep_prob,
-                        class_names=class_names,
-                        task=f"{task_name} — {mode.upper()} — Deployment",
-                    )
-                    if dep_metrics["auc"] is not None:
-                        log.info("  Deployment AUC: %.4f", dep_metrics["auc"])
-                except Exception:
-                    pass
-                dep_path = output_dir / f"deployment_{tag}.pkl"
-                joblib.dump({
-                    "model":         dep_model,
-                    "feature_names": deploy_feats,
-                    "class_names":   class_names,
-                    "label_encoder": le,
-                    "note": "Deployment model: SCADA + stress features only.",
-                }, dep_path)
-                log.info("  Saved deployment model: %s", dep_path.name)
+    if dep_model is not None and deploy_feats:
+        deploy_idx = [feature_names.index(f) for f in deploy_feats]
+        # Reuse the same classification_metrics() helper the primary
+        # model uses above, rather than re-deriving AUC inline. The
+        # two must agree on binary-vs-multiclass handling — that
+        # helper branches on the *actual* y_prob column count, which
+        # is the correct signal (a classification task can still
+        # have exactly 2 classes in a given split, in which case the
+        # binary path is right even though is_cls=True for the task
+        # as a whole).
+        try:
+            dep_prob = dep_model.predict_proba(X_te[:, deploy_idx])
+            dep_metrics = classification_metrics(
+                y_te, dep_model.predict(X_te[:, deploy_idx]), dep_prob,
+                class_names=class_names,
+                task=f"{task_name} — {mode.upper()} — Deployment",
+            )
+            if dep_metrics["auc"] is not None:
+                log.info("  Deployment AUC: %.4f", dep_metrics["auc"])
+        except Exception:
+            pass
+        dep_path = output_dir / f"deployment_{tag}.pkl"
+        joblib.dump({
+            "model":         dep_model,
+            "feature_names": deploy_feats,
+            "class_names":   class_names,
+            "label_encoder": le,
+            "note": "Deployment model: SCADA + stress features only.",
+        }, dep_path)
+        log.info("  Saved deployment model: %s", dep_path.name)
 
     return {
         "model":         model,
@@ -554,6 +596,239 @@ def _fit_eval_save_tabular(
         "y_pred":        y_pred_out,
         "model_path":    str(model_path),
     }
+
+
+# ---------------------------------------------------------------------------
+#  Batched tabular fitting — never holds every training row in memory at once
+# ---------------------------------------------------------------------------
+
+def _fit_tabular_batched(
+    mode: str,
+    train_entries: list[dict],
+    cfg,
+    feature_cols: list[str],
+    is_cls: bool,
+    le,
+    save_deployment: bool,
+    rows_per_batch: int | str | None,
+    files_per_batch: int,
+    majority_thin_factor: int,
+    lookback_window: int,
+    **estimator_kwargs,
+):
+    """Fit one tabular estimator across ``train_entries`` in file-group
+    batches via scikit-learn's ``warm_start``, instead of loading every
+    training row into memory at once.
+
+    Mechanics
+    ---------
+    ``train_entries`` is split into groups of ``files_per_batch`` files.
+    For each group: :func:`~library.data.loader.load_split` loads (and
+    thins/caps, exactly as the single-shot path would) just that group,
+    the estimator is built with ``warm_start=True`` on the first batch and
+    grown by adding more trees on every batch after — each new tree is
+    fit on that batch's data only, while every previously-built tree is
+    left untouched. The batch's DataFrame/arrays go out of scope (and are
+    explicitly ``del``eted) before the next batch is loaded, so peak
+    memory is bounded by one batch's data plus the (much smaller) forest
+    itself, regardless of how many total files/rows ``train_entries``
+    spans.
+
+    The requested ``n_estimators`` (default 200, or whatever
+    ``tabular_kwargs``/``rf_params`` specifies) is treated as the FINAL
+    total forest size, split as evenly as possible across batches — you
+    don't need to think in terms of "trees per batch"; ask for the same
+    forest size you would in the single-shot path and it's divided up
+    automatically (remainder trees go to the last batch).
+
+    Known limitations
+    -----------------
+    - Only works for estimators that support ``warm_start`` (currently
+      just ``"random_forest"`` among ``TABULAR_ESTIMATORS`` — raises
+      ``TypeError`` from the underlying constructor if the mode doesn't
+      accept the keyword).
+    - Class weighting: scikit-learn recomputes ``class_weight="balanced"``
+      fresh on every ``fit()`` call from THAT call's data, which it warns
+      against for ``warm_start`` when different batches see different
+      data. This function follows scikit-learn's own recommendation:
+      weights are computed once, from the first non-empty batch, and
+      reused as a fixed dict for every later batch — rather than left to
+      drift batch-to-batch. If ``estimator_kwargs`` already specifies
+      ``class_weight``, that's respected as-is instead.
+    - Evaluation (``X_te``/``y_te``) is unaffected — this only changes
+      how training data is consumed. Prediction over a bounded test set
+      is far cheaper than fitting 200 trees, and isn't a memory bottleneck.
+
+    Returns
+    -------
+    model : fitted estimator, or None if no batch produced any data
+    dep_model : fitted deployment-feature-subset estimator, or None
+    used : list[str] — canonical feature column list every batch was
+        built against (established from the first non-empty batch)
+    deploy_idx : list[int] — indices into ``used`` for the deployment
+        feature subset
+    deploy_feats : list[str] — the deployment feature names themselves
+    """
+    from library.data.loader import load_split
+    from library.features import build_feature_matrix
+    from library.models.definitions import build_model
+
+    chunks = [train_entries[i:i + files_per_batch]
+              for i in range(0, len(train_entries), files_per_batch)]
+    n_chunks = len(chunks)
+    if n_chunks == 0:
+        return None, None, [], [], []
+
+    kwargs = dict(estimator_kwargs)
+    total_n_estimators = kwargs.pop("n_estimators", 200)
+    if kwargs.pop("warm_start", True) is False:
+        log.info("  Ignoring warm_start=False — batched training requires it.")
+    random_state = kwargs.get("random_state", 42)
+
+    # Split the requested total as evenly as possible; remainder goes to
+    # the last batch so the final forest size matches what was asked for.
+    base_per_chunk = max(1, total_n_estimators // n_chunks)
+    per_chunk_counts = [base_per_chunk] * n_chunks
+    per_chunk_counts[-1] += total_n_estimators - base_per_chunk * n_chunks
+
+    log.info("  Batched training: %d file(s) in %d batch(es) of ~%d file(s), "
+             "target %d total trees (~%d/batch)",
+             len(train_entries), n_chunks, files_per_batch,
+             total_n_estimators, base_per_chunk)
+
+    model = None
+    dep_model = None
+    used: list[str] = []
+    deploy_idx: list[int] = []
+    deploy_feats: list[str] = []
+
+    for i, (chunk_entries, n_new_trees) in enumerate(zip(chunks, per_chunk_counts)):
+        log.info("  Batch %d/%d — %d file(s), +%d trees",
+                 i + 1, n_chunks, len(chunk_entries), n_new_trees)
+        chunk_df = load_split(
+            chunk_entries, cfg, max_rows=rows_per_batch,
+            lookback_window=lookback_window, random_state=random_state,
+            majority_thin_factor=majority_thin_factor,
+        )
+        if is_cls and "fault_active" in chunk_df.columns:
+            chunk_df = chunk_df[chunk_df["fault_active"]].copy()
+        if chunk_df.empty:
+            log.info("    (empty after filtering — skipped)")
+            del chunk_df
+            continue
+
+        if not used:
+            # Canonical column list, established from the first non-empty
+            # batch and reused (not re-derived) for every later batch, so
+            # column count/order can't drift between the warm_start fit()
+            # calls feeding the same forest.
+            _, used = build_feature_matrix(chunk_df, feature_cols)
+            if save_deployment:
+                deploy_set = set(cfg.feature_set("scada+stress"))
+                deploy_idx = [j for j, f in enumerate(used) if f in deploy_set]
+                deploy_feats = [used[j] for j in deploy_idx]
+
+        X_chunk, _ = build_feature_matrix(chunk_df, used)
+        if is_cls:
+            y_chunk = le.transform(chunk_df["fault_type"].values)
+        else:
+            y_chunk = chunk_df["fault_active"].values.astype(int)
+        del chunk_df
+
+        if "class_weight" not in kwargs and model is None:
+            # scikit-learn warns explicitly against class_weight="balanced"
+            # (the default _build_random_forest would otherwise use) with
+            # warm_start when each fit() call sees different data: it's
+            # recomputed fresh from THAT call's y, so weighting can drift
+            # batch to batch instead of reflecting the dataset as a whole.
+            # Its own recommendation is to precompute weights from a
+            # representative sample and pass them as a fixed dict — done
+            # here, once, from this first batch (already thinned toward
+            # balance by majority_thin_factor, so a reasonable proxy for
+            # the rest), and reused unchanged for every later batch so
+            # every tree in the forest is grown under the same weighting.
+            from sklearn.utils.class_weight import compute_class_weight
+            classes = np.unique(y_chunk)
+            weights = compute_class_weight("balanced", classes=classes, y=y_chunk)
+            kwargs["class_weight"] = dict(zip(classes.tolist(), weights.tolist()))
+            log.info("  Fixed class_weight from batch 1 (reused for all "
+                     "batches): %s", kwargs["class_weight"])
+
+        if model is None:
+            model = build_model(mode, n_estimators=n_new_trees,
+                                warm_start=True, **kwargs)
+        else:
+            model.n_estimators += n_new_trees
+        model.fit(X_chunk, y_chunk)
+        log.info("    Forest now has %d trees (%s rows this batch)",
+                 model.n_estimators, f"{len(X_chunk):,}")
+
+        if save_deployment and deploy_idx:
+            X_dep = X_chunk[:, deploy_idx]
+            if dep_model is None:
+                dep_model = build_model(mode, n_estimators=n_new_trees,
+                                        warm_start=True, **kwargs)
+            else:
+                dep_model.n_estimators += n_new_trees
+            dep_model.fit(X_dep, y_chunk)
+            del X_dep
+
+        del X_chunk, y_chunk
+
+    return model, dep_model, used, deploy_idx, deploy_feats
+
+
+def _fit_eval_save_tabular_batched(
+    mode: str,
+    task_name: str,
+    train_entries: list[dict],
+    cfg,
+    feature_cols: list[str],
+    is_cls: bool,
+    le,
+    class_names: list[str],
+    output_dir,
+    tag_base: str,
+    test_df,
+    save_deployment: bool,
+    rows_per_batch: int | str | None,
+    files_per_batch: int,
+    majority_thin_factor: int,
+    lookback_window: int,
+    **estimator_kwargs,
+) -> dict | None:
+    """Batched counterpart to :func:`_fit_eval_save_tabular`: fits ``mode``
+    across ``train_entries`` in file-group batches (see
+    :func:`_fit_tabular_batched`) instead of loading every training row at
+    once, then evaluates/plots/saves through the same
+    :func:`_eval_save_tabular` the single-shot path uses.
+    """
+    from library.features import build_feature_matrix
+
+    try:
+        model, dep_model, used, _deploy_idx, deploy_feats = _fit_tabular_batched(
+            mode, train_entries, cfg, feature_cols, is_cls, le,
+            save_deployment, rows_per_batch, files_per_batch,
+            majority_thin_factor, lookback_window, **estimator_kwargs,
+        )
+    except ImportError as exc:
+        log.info("  Skipping tabular mode %r — %s", mode, exc)
+        return None
+
+    if model is None:
+        log.info("  No training data produced any batches — skipping %r.", mode)
+        return None
+
+    X_te, _ = build_feature_matrix(test_df, used)
+    if is_cls:
+        y_te = le.transform(test_df["fault_type"].values)
+    else:
+        y_te = test_df["fault_active"].values.astype(int)
+
+    return _eval_save_tabular(
+        mode, task_name, model, dep_model, X_te, y_te, used,
+        deploy_feats, is_cls, le, class_names, output_dir, tag_base, cfg,
+    )
 
 
 def _run_tabular_modes(
@@ -578,6 +853,8 @@ def _run_tabular_modes(
     return_details: bool,
     max_test_rows: int | str | None = 1_000_000,
     majority_thin_factor: int = 1,
+    rows_per_batch: int | str | None = None,
+    files_per_batch: int = 10,
 ) -> dict:
     """Fit every requested tabular estimator against one shared data load.
 
@@ -621,6 +898,30 @@ def _run_tabular_modes(
         applied to ``test_df``: thinning the evaluation set would bias
         reported precision/recall/AUC away from the true healthy/faulted
         ratio, which defeats the point of holding out a test set at all.
+
+    rows_per_batch, files_per_batch
+    --------------------------------
+    A *different kind of fix* from everything above. ``max_train_rows``
+    (and ``"auto"``) only bound how much data gets LOADED — they say
+    nothing about whether the model you then train on that data fits in
+    memory, and ``RandomForestClassifier.fit()`` genuinely doesn't scale
+    gently: fitting many trees in parallel (``n_jobs``) on a large matrix
+    can exhaust memory even when the matrix itself loaded fine, with no
+    Python traceback (an OS-level OOM kill, not a raised exception).
+
+    When ``rows_per_batch`` is not ``None``, the tabular family switches
+    to batched training entirely: ``train_entries`` is grouped into
+    batches of ``files_per_batch`` files, each batch is loaded (capped to
+    ``rows_per_batch`` rows, with ``majority_thin_factor`` still applied)
+    and used to grow the forest by scikit-learn's ``warm_start`` — new
+    trees fit on that batch only, previously-built trees untouched — so
+    peak memory is bounded by one batch's data, never the whole training
+    set. See :func:`_fit_tabular_batched` for the full mechanics and
+    known limitations (only estimators supporting ``warm_start``;
+    per-batch rather than global class-weight balancing). ``None``
+    (default) preserves the exact single-shot behaviour above — this is
+    a strict opt-in, and only affects the tabular family (sequence models
+    already train in batches by construction).
     """
     from library.data.loader import load_split, stratified_subsample
     from library.features import build_feature_matrix
@@ -630,22 +931,18 @@ def _run_tabular_modes(
     log.info("  TABULAR %s  —  modes: %s", task_name.upper(), ", ".join(modes))
     log.info("=" * 65)
 
-    log.info("  Loading train files …")
-    train_df = load_split(train_entries, cfg, max_rows=max_train_rows,
-                          lookback_window=lookback_window, random_state=random_state,
-                          majority_thin_factor=majority_thin_factor)
     log.info("  Loading test  files …")
     # No majority_thin_factor here — the test split must stay at its true,
-    # untouched healthy/faulted ratio (see docstring above).
-    test_df  = load_split(test_entries,  cfg, max_rows=max_test_rows,
-                          lookback_window=lookback_window, random_state=random_state)
+    # untouched healthy/faulted ratio (see docstring above). Loaded first
+    # (and independent of train) since both the single-shot and batched
+    # training paths below need it, and it's comparatively cheap.
+    test_df = load_split(test_entries, cfg, max_rows=max_test_rows,
+                         lookback_window=lookback_window, random_state=random_state)
 
     if is_cls:
-        if "fault_active" in train_df.columns:
-            train_df = train_df[train_df["fault_active"]].copy()
         if "fault_active" in test_df.columns:
             test_df = test_df[test_df["fault_active"]].copy()
-        if not train_df.empty and not test_df.empty:
+        if not test_df.empty:
             # The shared LabelEncoder was fit on train+val data; a fault
             # type confined entirely to test files wouldn't be in its
             # vocabulary. Drop those rows rather than crash on transform().
@@ -656,8 +953,44 @@ def _run_tabular_modes(
                          "in the shared label encoder", n_unknown)
                 test_df = test_df.loc[known].copy()
 
-    if train_df.empty or test_df.empty:
-        log.info("  Not enough data — skipping tabular modes.")
+    if test_df.empty:
+        log.info("  Not enough test data — skipping tabular modes.")
+        return {}
+
+    tabular_kwargs = tabular_kwargs or {}
+    tag_base = artifact_prefix or task_name.lower().replace(" ", "_")
+    results: dict = {}
+
+    if rows_per_batch is not None:
+        # === Batched training path — never loads all of train_entries at
+        # once. See this function's own docstring above and
+        # _fit_tabular_batched()'s for the full mechanics. ===
+        for mode in modes:
+            kwargs = dict(tabular_kwargs.get(mode, {}))
+            kwargs.setdefault("random_state", random_state)
+            details = _fit_eval_save_tabular_batched(
+                mode, task_name, train_entries, cfg, feature_cols,
+                is_cls, le, class_names, output_dir, tag_base, test_df,
+                save_deployment=save_deployment,
+                rows_per_batch=rows_per_batch, files_per_batch=files_per_batch,
+                majority_thin_factor=majority_thin_factor,
+                lookback_window=lookback_window, **kwargs,
+            )
+            if details:
+                results[mode] = details if return_details else details["report"]
+        return results
+
+    # === Single-shot training path (unchanged behaviour) ===
+    log.info("  Loading train files …")
+    train_df = load_split(train_entries, cfg, max_rows=max_train_rows,
+                          lookback_window=lookback_window, random_state=random_state,
+                          majority_thin_factor=majority_thin_factor)
+
+    if is_cls and "fault_active" in train_df.columns:
+        train_df = train_df[train_df["fault_active"]].copy()
+
+    if train_df.empty:
+        log.info("  Not enough train data — skipping tabular modes.")
         return {}
 
     # Shared, stratified subsample — applied ONCE so every tabular mode in
@@ -697,10 +1030,6 @@ def _run_tabular_modes(
     log.info("  Train: %s rows  Test: %s rows  Features: %d",
              f"{len(X_tr):,}", f"{len(X_te):,}", len(used))
 
-    tabular_kwargs = tabular_kwargs or {}
-    tag_base = artifact_prefix or task_name.lower().replace(" ", "_")
-    results: dict = {}
-
     for mode in modes:
         kwargs = dict(tabular_kwargs.get(mode, {}))
         kwargs.setdefault("random_state", random_state)
@@ -713,6 +1042,7 @@ def _run_tabular_modes(
             results[mode] = details if return_details else details["report"]
 
     return results
+
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1328,8 @@ def run_task(
     max_train_rows: int | str | None = 1_000_000,
     max_test_rows: int | str | None = 1_000_000,
     majority_thin_factor: int = 1,
+    rows_per_batch: int | str | None = None,
+    files_per_batch: int = 10,
     random_state: int = 42,
     tabular_kwargs: dict[str, dict] | None = None,
     save_deployment: bool = True,
@@ -1112,6 +1444,29 @@ def run_task(
         imbalance in the other direction rather than just trimming
         redundancy. Watch the "Train: N rows" log line after enabling it
         to see the effect.
+    rows_per_batch : int, "auto", or None
+        Switches the tabular family to batched training when not
+        ``None``: ``train_entries`` is loaded and fit in groups of
+        ``files_per_batch`` files (each capped to ``rows_per_batch`` rows)
+        instead of one single load + one single ``.fit()`` call, growing
+        the forest across batches via scikit-learn's ``warm_start`` — see
+        :func:`_fit_tabular_batched` for the full mechanics. This is a
+        genuinely different fix from ``max_train_rows``/``"auto"``: those
+        bound how much data gets *loaded*, but say nothing about whether
+        fitting hundreds of trees on that data fits in memory —
+        ``RandomForestClassifier.fit()`` needs its entire training matrix
+        at once no matter how it got capped, and with ``n_jobs`` this can
+        exhaust memory even on a modest, already-loaded row count. Default
+        ``None``: batching disabled, identical single-shot behaviour to
+        before this parameter existed. Has no effect on sequence modes,
+        which already train in batches by construction (memmap-backed
+        windows + DataLoader). Only usable with tabular modes that support
+        ``warm_start`` (currently just ``"random_forest"``).
+    files_per_batch : int
+        How many files make up one batch when ``rows_per_batch`` is set.
+        Ignored otherwise. Smaller = lower peak memory per batch, more
+        batches, more overhead re-reading parquet schemas; larger = the
+        opposite. Default ``10``.
     random_state : int
         Seed for the shared tabular subsample and the default
         ``random_state`` of any tabular estimator that doesn't override it
@@ -1226,6 +1581,7 @@ def run_task(
             max_train_rows, random_state, tabular_kwargs, save_deployment,
             return_details, max_test_rows=max_test_rows,
             majority_thin_factor=majority_thin_factor,
+            rows_per_batch=rows_per_batch, files_per_batch=files_per_batch,
         ))
 
     # --- 4. Sequence family ---------------------------------------------------

@@ -50,6 +50,11 @@ def _run_dual_tasks(
     rf_params: dict | None,
     custom_runners: dict[str, callable] | None,
     prefix: str,
+    max_train_rows: int | str | None = 1_000_000,
+    max_test_rows: int | str | None = 1_000_000,
+    majority_thin_factor: int = 1,
+    rows_per_batch: int | str | None = None,
+    files_per_batch: int = 10,
 ) -> dict:
     tasks = [
         ("Fault Detection", "fault_active", "detection_auc"),
@@ -78,6 +83,11 @@ def _run_dual_tasks(
             test_entries=test_entries,
             artifact_prefix=f"{prefix}_{_task_slug(task_name)}",
             rf_params=rf_params,
+            max_train_rows=max_train_rows,
+            max_test_rows=max_test_rows,
+            majority_thin_factor=majority_thin_factor,
+            rows_per_batch=rows_per_batch,
+            files_per_batch=files_per_batch,
             custom_runners=custom_runners,
             return_details=True,
         )
@@ -104,6 +114,11 @@ def run_temporal_split(
     rf_params: dict | None = None,
     custom_runners: dict[str, callable] | None = None,
     random_state: int = 42,
+    max_train_rows: int | str | None = 1_000_000,
+    max_test_rows: int | str | None = 1_000_000,
+    majority_thin_factor: int = 1,
+    rows_per_batch: int | str | None = None,
+    files_per_batch: int = 10,
 ) -> dict:
     """Train on early sim years and evaluate on the final sim year.
 
@@ -122,6 +137,20 @@ def run_temporal_split(
     loader (``_load_train_test_from_registry``) and the PyTorch loader
     both recognise the ``sim_year_filter`` key and filter rows accordingly,
     so no data is physically duplicated and no new files need to be created.
+
+    max_train_rows, max_test_rows, majority_thin_factor, rows_per_batch,
+    files_per_batch
+    ----------------------------------------------------------------------
+    Forwarded straight through to :func:`~library.models.run_model_task`
+    for both the detection and classification tasks run here (see that
+    function's docstring for what each does). Previously this function
+    didn't expose any of these, so every call to it silently used
+    ``run_model_task``'s defaults regardless of what the main training
+    run in the same notebook was configured with — meaning a temporal
+    split could end up training on a differently-thinned, differently-
+    capped, or non-batched dataset than the main task it's meant to be
+    compared against. Defaults here match ``run_model_task``'s own, so
+    omitting them keeps prior behaviour unchanged.
     """
     model_modes = model_modes or ["random_forest"]
     output_dir = Path(output_dir)
@@ -201,6 +230,11 @@ def run_temporal_split(
         rf_params=rf_params,
         custom_runners=custom_runners,
         prefix="temporal",
+        max_train_rows=max_train_rows,
+        max_test_rows=max_test_rows,
+        majority_thin_factor=majority_thin_factor,
+        rows_per_batch=rows_per_batch,
+        files_per_batch=files_per_batch,
     )
 
     for mode, metrics in results.items():
@@ -228,8 +262,20 @@ def run_cross_location(
     rf_params: dict | None = None,
     custom_runners: dict[str, callable] | None = None,
     random_state: int = 42,
+    max_train_rows: int | str | None = 1_000_000,
+    max_test_rows: int | str | None = 1_000_000,
+    majority_thin_factor: int = 1,
+    rows_per_batch: int | str | None = None,
+    files_per_batch: int = 10,
 ) -> list[dict]:
-    """Leave-one-site-out evaluation for each selected model mode."""
+    """Leave-one-site-out evaluation for each selected model mode.
+
+    max_train_rows, max_test_rows, majority_thin_factor, rows_per_batch,
+    files_per_batch : forwarded to :func:`~library.models.run_model_task`
+    for every site fold — see :func:`run_temporal_split`'s docstring for
+    why these are exposed here rather than left to silently differ from
+    the main training run.
+    """
     model_modes = model_modes or ["random_forest"]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -275,6 +321,11 @@ def run_cross_location(
             rf_params=rf_params,
             custom_runners=custom_runners,
             prefix=f"cross_location_{test_loc}",
+            max_train_rows=max_train_rows,
+            max_test_rows=max_test_rows,
+            majority_thin_factor=majority_thin_factor,
+            rows_per_batch=rows_per_batch,
+            files_per_batch=files_per_batch,
         )
         site_name = cfg.get_location_name(*[float(x) for x in test_loc.split("_")])
         for mode, metrics in metrics_by_mode.items():
@@ -318,8 +369,25 @@ def run_feature_ablation(
     num_workers: int = 0,
     rf_params: dict | None = None,
     custom_runners: dict[str, callable] | None = None,
+    max_train_rows: int | str | None = 1_000_000,
+    max_test_rows: int | str | None = 1_000_000,
+    majority_thin_factor: int = 1,
+    rows_per_batch: int | str | None = None,
+    files_per_batch: int = 10,
 ) -> list[dict]:
-    """Detection ablation study across feature sets for each selected mode."""
+    """Detection ablation study across feature sets for each selected mode.
+
+    max_train_rows, max_test_rows, majority_thin_factor, rows_per_batch,
+    files_per_batch : forwarded to :func:`~library.models.run_model_task`
+    for every feature set — see :func:`run_temporal_split`'s docstring
+    for why these are exposed here rather than left to silently differ
+    from the main training run. Note this study reuses
+    ``train_entries``/``val_entries``/``test_entries`` from the
+    registry's existing split assignment across every feature set — each
+    set still gets its own fresh ``load_split`` call (and thus its own
+    majority-thinning draw / batch pass), since feature columns differ
+    but rows don't need to.
+    """
     model_modes = model_modes or ["random_forest"]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -358,6 +426,11 @@ def run_feature_ablation(
             test_entries=test_entries,
             artifact_prefix=f"ablation_{set_name.lower().replace(' ', '_').replace('+', 'plus')}",
             rf_params=rf_params,
+            max_train_rows=max_train_rows,
+            max_test_rows=max_test_rows,
+            majority_thin_factor=majority_thin_factor,
+            rows_per_batch=rows_per_batch,
+            files_per_batch=files_per_batch,
             custom_runners=custom_runners,
             return_details=True,
         )

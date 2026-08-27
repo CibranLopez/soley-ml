@@ -42,6 +42,8 @@ def run_model_task(
     max_train_rows: int | str | None = 1_000_000,
     max_test_rows: int | str | None = 1_000_000,
     majority_thin_factor: int = 1,
+    rows_per_batch: int | str | None = None,
+    files_per_batch: int = 10,
     custom_runners: dict[str, callable] | None = None,
     return_details: bool = False,
 ) -> dict:
@@ -80,6 +82,24 @@ def run_model_task(
         thinning, identical behaviour to before this parameter existed.
         Has no effect on sequence modes (``mlp``/``lstm``/``hybrid``),
         which need contiguous per-file timesteps for windowing.
+    rows_per_batch, files_per_batch
+        Forwarded to :func:`~library.models.trainer.run_task`. A
+        *different kind of fix* from ``max_train_rows``/``"auto"``: those
+        bound how much data gets loaded, not whether fitting a model on
+        it fits in memory — ``RandomForestClassifier.fit()`` needs its
+        whole training matrix at once regardless, and with ``n_jobs``
+        parallelism can exhaust memory (with no Python traceback — an OS
+        OOM kill, not a raised exception) even on an already-capped row
+        count. Setting ``rows_per_batch`` switches the tabular family to
+        batched training: ``train_entries`` grouped into
+        ``files_per_batch``-file batches, each loaded and used to grow
+        the forest via scikit-learn's ``warm_start`` one batch at a time,
+        so peak memory is bounded by one batch rather than the whole
+        training set. Default ``rows_per_batch=None``: batching disabled,
+        identical behaviour to before this parameter existed. Only
+        affects the tabular family (sequence models already train in
+        batches by construction) and only tabular modes supporting
+        ``warm_start`` (currently just ``"random_forest"``).
     """
     from .trainer import run_task
 
@@ -113,6 +133,8 @@ def run_model_task(
         max_train_rows=max_train_rows,
         max_test_rows=max_test_rows,
         majority_thin_factor=majority_thin_factor,
+        rows_per_batch=rows_per_batch,
+        files_per_batch=files_per_batch,
         custom_runners=custom_runners,
         return_details=return_details,
     )

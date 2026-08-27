@@ -46,16 +46,17 @@ log = logging.getLogger("library")
 # ---------------------------------------------------------------------------
 
 def _build_random_forest(*, n_estimators=200, max_depth=15,
-                         min_samples_leaf=20, random_state=42, **extra):
+                         min_samples_leaf=20, n_jobs=-1,
+                         class_weight="balanced", random_state=42, **extra):
     from sklearn.ensemble import RandomForestClassifier
 
     return RandomForestClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
-        class_weight="balanced",
+        class_weight=class_weight,
         random_state=random_state,
-        n_jobs=-1,
+        n_jobs=n_jobs,
         **extra,
     )
 
