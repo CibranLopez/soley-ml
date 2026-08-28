@@ -1079,6 +1079,89 @@ def _run_tabular_modes(
 #  Sequence family — one shared scaler + memmap build, then one fit per mode
 # ---------------------------------------------------------------------------
 
+def _warn_if_sequence_memory_risky(
+    modes: list[str],
+    window_size: int,
+    batch_size: int,
+    hidden_lstm: int,
+    n_lstm_layers: int,
+) -> None:
+    """Log a pre-flight warning when the requested LSTM/Hybrid config's
+    estimated backward-pass memory looks likely to exceed available
+    system RAM.
+
+    The tabular family already has a guardrail for its own OOM failure
+    mode — see ``MAX_TRAIN_ROWS``/``ROWS_PER_BATCH`` and the comments on
+    :func:`~library.models.pipeline.run_model_task` describing how
+    ``RandomForestClassifier.fit()`` on an uncapped row count can get the
+    whole process OS-killed with no Python traceback. Nothing previously
+    warned before ``lstm``/``hybrid`` training, even though it has an
+    analogous failure mode via a completely different mechanism:
+    backpropagation through a recurrent layer needs the hidden/cell
+    state and gate activations retained for *every* timestep in the
+    window simultaneously, so memory scales with ``batch_size *
+    window_size * hidden_lstm * n_lstm_layers`` — independent of how
+    carefully the *dataset* is streamed (the memmap design elsewhere in
+    this module already keeps that bounded; this is a separate,
+    purely compute-graph cost that memmapping cannot help with). At a
+    multi-day window and a batch size in the hundreds this is easily
+    several GB per training step, and on backends without a
+    hard-partitioned VRAM (Apple Silicon's MPS, or plain CPU — both put
+    this in the same pool the rest of the OS is using) an overrun
+    doesn't raise a catchable ``torch`` out-of-memory error the way a
+    discrete CUDA GPU would; it can instead present as heavy swapping or
+    an OS-level freeze, mid-epoch, with no Python traceback to point at.
+
+    This is a rough estimate, not a hard limit — it always lets training
+    proceed, just with an explicit warning naming which knob to lower
+    first (``batch_size`` and ``window_size`` are both linear in the
+    estimate, so halving either roughly halves it).
+
+    Parameters
+    ----------
+    modes : list[str]
+        Only warns if ``"lstm"`` or ``"hybrid"`` is requested — ``"mlp"``
+        only ever looks at a window's last timestep, so its backward
+        pass doesn't scale with ``window_size`` and isn't at risk here.
+    window_size, batch_size, hidden_lstm, n_lstm_layers : int
+        As passed to :func:`_run_sequence_modes` /
+        :func:`~library.models.definitions.build_sequence_model`.
+    """
+    if not ({"lstm", "hybrid"} & set(modes)):
+        return
+
+    from library.data.loader import _available_memory_bytes
+
+    # Backward-pass buffers retained per timestep, per layer: hidden
+    # state, cell state, and the four gate pre-activations — 6 tensors
+    # of shape (batch_size, hidden_lstm), each 4 bytes (float32). Real
+    # backends vary in exactly what they retain, so this is treated as a
+    # conservative lower bound rather than an exact figure.
+    per_step_bytes   = batch_size * hidden_lstm * 4 * 6
+    estimated_bytes  = per_step_bytes * window_size * n_lstm_layers
+
+    try:
+        available = _available_memory_bytes()
+    except Exception:
+        return  # best-effort only — never block training on this check
+
+    if estimated_bytes > 0.5 * available:
+        log.warning(
+            "  Sequence memory check: lstm/hybrid at window_size=%d, "
+            "batch_size=%d, hidden_lstm=%d, n_lstm_layers=%d is roughly "
+            "%s of recurrent backward-pass memory alone — %.0f%% of the "
+            "%s currently available. This is on top of the model, "
+            "optimizer, and everything else already resident. If this "
+            "causes swapping or a system freeze rather than a clean "
+            "error, lower batch_size and/or window_size first — both "
+            "scale the estimate linearly.",
+            window_size, batch_size, hidden_lstm, n_lstm_layers,
+            f"{estimated_bytes / (1024**3):.1f} GB",
+            100 * estimated_bytes / available,
+            f"{available / (1024**3):.1f} GB",
+        )
+
+
 def _run_sequence_modes(
     modes: list[str],
     task_name: str,
@@ -1151,6 +1234,9 @@ def _run_sequence_modes(
     n_classes = len(class_names)
     log.info("  Classes: %d  Files: train=%d, val=%d, test=%d",
              n_classes, len(train_entries), len(val_entries), len(test_entries))
+
+    _warn_if_sequence_memory_risky(
+        modes, window_size, batch_size, hidden_lstm=128, n_lstm_layers=2)
 
     log.info("  Fitting scaler …")
     scaler, available = fit_scaler_streaming(
