@@ -435,6 +435,91 @@ def discover_fault_types(entries: list[dict]) -> list[str]:
     return sorted(types)
 
 
+def discover_class_counts(
+    entries: list[dict],
+    target_col: str,
+    le=None,
+) -> dict[int, int]:
+    """Count real, per-file label occurrences across ``entries``, encoded
+    the same way every downstream caller encodes ``y``.
+
+    Reads only the ``fault_type`` / ``fault_active`` columns — the same
+    cheap, feature-free read :func:`discover_fault_types` uses — so this
+    is safe to call over an entire training entry list, not just a
+    sample of it.
+
+    This exists for ``class_weight="balanced"`` computations that must be
+    fixed once and reused across multiple ``.fit()`` calls (e.g.
+    ``warm_start`` batched training in
+    :func:`~library.models.trainer._fit_tabular_batched`). Deriving those
+    weights from a single batch's ``y`` is fragile — a batch can easily
+    miss a class entirely, since ``train_entries`` preserves the
+    registry's path-sorted order and consecutive files often share a
+    ``fault_type`` (it's parsed from the filename). Scanning every
+    training file's label column up front avoids that regardless of
+    batch order or size.
+
+    Parameters
+    ----------
+    entries : list[dict]
+        Registry entries with ``"path"`` and optionally
+        ``"sim_year_filter"``.
+    target_col : {"fault_active", "fault_type"}
+        * ``"fault_active"`` — counts are keyed by ``0``/``1``
+          (unfaulted/faulted), matching what every caller already puts
+          in ``y`` for the detection task. ``le`` is ignored.
+        * ``"fault_type"`` — rows are restricted to ``fault_active``
+          first (matching how every caller filters to faulted-only rows
+          before building ``y`` for the classification task), then
+          encoded via ``le.transform`` so keys match ``y`` exactly. Rows
+          whose ``fault_type`` isn't in ``le.classes_`` are skipped, same
+          as the ``known = df["fault_type"].isin(le.classes_)`` filter
+          used elsewhere.
+    le : LabelEncoder or None
+        Required when ``target_col == "fault_type"``.
+
+    Returns
+    -------
+    dict[int, int]
+        Encoded class label -> total row count across every given entry.
+        A class that never occurs in ``entries`` is simply absent (not
+        present with count 0) — callers needing every known class
+        represented should fill in zeros themselves from ``le.classes_``
+        / ``{0, 1}``.
+    """
+    if target_col == "fault_type" and le is None:
+        raise ValueError("le is required when target_col='fault_type'")
+
+    counts: dict[int, int] = {}
+    for e in entries:
+        try:
+            df = _read_parquet_with_year_filter(
+                e["path"], ["fault_type", "fault_active"], e.get("sim_year_filter"))
+        except Exception:
+            continue
+        if df.empty:
+            continue
+
+        if target_col == "fault_type":
+            if "fault_active" in df.columns:
+                df = df[df["fault_active"]]
+            if "fault_type" not in df.columns or df.empty:
+                continue
+            known = df["fault_type"].isin(le.classes_)
+            if not known.any():
+                continue
+            encoded = le.transform(df.loc[known, "fault_type"].values)
+        else:
+            if "fault_active" not in df.columns:
+                continue
+            encoded = df["fault_active"].astype(int).values
+
+        for cls, n in zip(*np.unique(encoded, return_counts=True)):
+            counts[int(cls)] = counts.get(int(cls), 0) + int(n)
+
+    return counts
+
+
 # ---------------------------------------------------------------------------
 #  Collector: list of registry entries → one DataFrame
 # ---------------------------------------------------------------------------

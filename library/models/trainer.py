@@ -651,10 +651,17 @@ def _fit_tabular_batched(
       fresh on every ``fit()`` call from THAT call's data, which it warns
       against for ``warm_start`` when different batches see different
       data. This function follows scikit-learn's own recommendation:
-      weights are computed once, from the first non-empty batch, and
-      reused as a fixed dict for every later batch — rather than left to
-      drift batch-to-batch. If ``estimator_kwargs`` already specifies
-      ``class_weight``, that's respected as-is instead.
+      weights are computed once, from a full scan of every training
+      file's label column (via
+      :func:`~library.data.loader.discover_class_counts` — cheap, since
+      it reads only the label columns, not the feature columns), and
+      reused as a fixed dict for every batch — rather than derived from
+      one batch (fragile: an early batch can easily contain only one
+      class, since ``train_entries`` preserves the registry's
+      path-sorted order and consecutive files often share a
+      ``fault_type``) or left to drift batch-to-batch. If
+      ``estimator_kwargs`` already specifies ``class_weight``, that's
+      respected as-is instead.
     - Evaluation (``X_te``/``y_te``) is unaffected — this only changes
       how training data is consumed. Prediction over a bounded test set
       is far cheaper than fitting 200 trees, and isn't a memory bottleneck.
@@ -696,6 +703,48 @@ def _fit_tabular_batched(
              len(train_entries), n_chunks, files_per_batch,
              total_n_estimators, base_per_chunk)
 
+    if "class_weight" not in kwargs:
+        # scikit-learn warns explicitly against class_weight="balanced"
+        # (the default _build_random_forest would otherwise use) with
+        # warm_start when each fit() call sees different data: it's
+        # recomputed fresh from THAT call's y, so weighting can drift
+        # batch to batch instead of reflecting the dataset as a whole.
+        # Its own recommendation is to precompute weights from a
+        # representative sample and pass them as a fixed dict.
+        #
+        # This used to be computed from only the FIRST batch's y_chunk —
+        # fragile, since train_entries preserves the registry's
+        # path-sorted order and consecutive files often share a
+        # fault_type (parsed from the filename), so an early batch can
+        # easily contain only one class. The next batch to see the
+        # missing class then fails validation against the frozen dict
+        # (ValueError: "The classes, [...], are not in class_weight").
+        # Scanning every training file's label column up front — cheap,
+        # since it reads only the label columns, not the feature columns
+        # — fixes this regardless of batch order or contents.
+        from library.data.loader import discover_class_counts
+
+        all_classes = list(range(len(le.classes_))) if is_cls else [0, 1]
+        counts = discover_class_counts(
+            train_entries,
+            target_col="fault_type" if is_cls else "fault_active",
+            le=le,
+        )
+        total = sum(counts.get(c, 0) for c in all_classes)
+        n_known = len(all_classes)
+        weights = {}
+        for c in all_classes:
+            n_c = counts.get(c, 0)
+            if n_c == 0:
+                log.info("  Class %s never observed across training "
+                         "entries — defaulting its class_weight to 1.0", c)
+                weights[c] = 1.0
+            else:
+                weights[c] = total / (n_known * n_c)
+        kwargs["class_weight"] = weights
+        log.info("  Fixed class_weight from full training-entry label "
+                 "scan (reused for all batches): %s", kwargs["class_weight"])
+
     model = None
     dep_model = None
     used: list[str] = []
@@ -734,25 +783,6 @@ def _fit_tabular_batched(
         else:
             y_chunk = chunk_df["fault_active"].values.astype(int)
         del chunk_df
-
-        if "class_weight" not in kwargs and model is None:
-            # scikit-learn warns explicitly against class_weight="balanced"
-            # (the default _build_random_forest would otherwise use) with
-            # warm_start when each fit() call sees different data: it's
-            # recomputed fresh from THAT call's y, so weighting can drift
-            # batch to batch instead of reflecting the dataset as a whole.
-            # Its own recommendation is to precompute weights from a
-            # representative sample and pass them as a fixed dict — done
-            # here, once, from this first batch (already thinned toward
-            # balance by majority_thin_factor, so a reasonable proxy for
-            # the rest), and reused unchanged for every later batch so
-            # every tree in the forest is grown under the same weighting.
-            from sklearn.utils.class_weight import compute_class_weight
-            classes = np.unique(y_chunk)
-            weights = compute_class_weight("balanced", classes=classes, y=y_chunk)
-            kwargs["class_weight"] = dict(zip(classes.tolist(), weights.tolist()))
-            log.info("  Fixed class_weight from batch 1 (reused for all "
-                     "batches): %s", kwargs["class_weight"])
 
         if model is None:
             model = build_model(mode, n_estimators=n_new_trees,
