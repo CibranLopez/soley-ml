@@ -399,8 +399,8 @@ def run_feature_ablation(
     base_cols = cfg.feature_set("full")
     feature_sets = {
         "SCADA only": cfg.feature_set("scada"),
-        "SCADA + stress": [c for c in base_cols if c in set(cfg.scada_features) | set(cfg.stress_features)],
-        "SCADA + device physics": [c for c in base_cols if c in set(cfg.scada_features) | set(cfg.device_features)],
+        "SCADA + stress": cfg.feature_set("scada+stress"),
+        "SCADA + IV curve": cfg.feature_set("scada+iv_curve"),
         "Full": base_cols,
     }
 

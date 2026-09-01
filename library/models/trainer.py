@@ -466,18 +466,31 @@ def _fit_eval_save_tabular(
     model.fit(X_tr, y_tr)
     log.info("  Trained in %.1fs", time.time() - t0)
 
-    # Deployment variant: same estimator family, SCADA + stress features
-    # only (works on real SCADA data — no SOLEY-simulation-only physics).
+    # Deployment variant: same estimator family, real-SCADA-only features
+    # (works on real SCADA data — no SOLEY-simulation-only physics).
     # Generalised from the original RF-only logic: works for whichever
     # `mode` was requested, since it goes through the same build_model().
-    # Uses cfg.feature_set("scada+stress") — the same authoritative method
-    # the notebooks use to build feature lists — rather than a hand-rolled
-    # copy of the engineered-feature names, so this can't drift out of
-    # sync with BatchConfig if a new engineered feature is ever added.
+    #
+    # Uses cfg.feature_set("scada") — NOT "scada+stress". BatchConfig's own
+    # categorisation (see library/config/batch_config.py) documents
+    # stress_features as "SOLEY-derived stress indicators": simulation-only,
+    # exactly like device_features, and — like device_features — absent
+    # from BatchConfig._SCADA_MEASURABLE. "scada+stress" was a bug: it
+    # smuggled simulation-only stress accumulators into what this docstring
+    # already claimed was a real-SCADA-only feature set (confirmed via the
+    # RF feature-importance plots this variant trains against — stress_*
+    # columns rank well inside the top 20 for both tasks, so this wasn't a
+    # negligible slip). "scada" (real sensor columns + the purely
+    # SCADA/timestamp-derived engineered features) is the only feature_set()
+    # mode that matches what this deployment variant's own name and comment
+    # have always claimed it evaluates. Still uses cfg.feature_set(...) —
+    # the same authoritative method the notebooks use — rather than a
+    # hand-rolled feature-name list, so this can't drift out of sync with
+    # BatchConfig if a new engineered feature is ever added.
     dep_model = None
     deploy_feats: list[str] = []
     if save_deployment:
-        deploy_set = set(cfg.feature_set("scada+stress"))
+        deploy_set = set(cfg.feature_set("scada"))
         deploy_idx = [i for i, f in enumerate(feature_names) if f in deploy_set]
         if deploy_idx:
             deploy_feats = [feature_names[i] for i in deploy_idx]
@@ -486,7 +499,7 @@ def _fit_eval_save_tabular(
             except ImportError:
                 dep_model = None
             if dep_model is not None:
-                log.info("  Training deployment model (SCADA+stress only) …")
+                log.info("  Training deployment model (real-SCADA-only) …")
                 dep_model.fit(X_tr[:, deploy_idx], y_tr)
 
     return _eval_save_tabular(
@@ -542,7 +555,7 @@ def _eval_save_tabular(
         plot_importance(model, feature_names, f"{task_name} — {mode.upper()}",
                         output_dir / f"importance_{tag}.png",
                         scada_features=cfg.scada_features,
-                        device_features=cfg.device_features)
+                        device_features=cfg.iv_curve_features)
 
     import joblib
     model_path = output_dir / f"model_{tag}.pkl"
@@ -581,7 +594,7 @@ def _eval_save_tabular(
             "feature_names": deploy_feats,
             "class_names":   class_names,
             "label_encoder": le,
-            "note": "Deployment model: SCADA + stress features only.",
+            "note": "Deployment model: real-SCADA-only features (see feature_names).",
         }, dep_path)
         log.info("  Saved deployment model: %s", dep_path.name)
 
@@ -601,6 +614,87 @@ def _eval_save_tabular(
 # ---------------------------------------------------------------------------
 #  Batched tabular fitting — never holds every training row in memory at once
 # ---------------------------------------------------------------------------
+
+def _class_balanced_file_chunks(
+    entries: list[dict],
+    files_per_batch: int,
+) -> list[list[dict]]:
+    """Split ``entries`` into ``files_per_batch``-file groups, interleaved
+    across ``fault_type`` instead of ``entries[i:i+files_per_batch]``.
+
+    Plain sequential slicing preserves the registry's path-sorted order,
+    and filenames encode fault type — so same-type files cluster together
+    in that order, and a contiguous slice can easily be one or two fault
+    types deep. For ``RandomForestClassifier`` warm_start training (see
+    :func:`_fit_tabular_batched`), a batch's ``np.unique(y)`` — not just
+    its class *weighting* — determines how many output columns the trees
+    grown on it get; a class a batch never saw for real is one this
+    batch's trees learned nothing about.
+
+    A first version of this function round-robined each group exactly
+    once — better than sequential slicing, but a group with fewer files
+    than others still ran dry partway through, and every batch AFTER
+    that point permanently lost real representation of that class for
+    the rest of training (confirmed against a real run: RF fault
+    classification collapsed to near-zero F1 on exactly the classes
+    whose files were exhausted earliest, while classes with abundant
+    files stayed strong — see the per-fault-type F1 chart from that
+    run). Smaller groups are now CYCLED — once a group's real files are
+    used up, it wraps back to its own first file rather than
+    contributing nothing — so every batch keeps at least some real rows
+    of every class for the full run, at the cost of a rarer class's few
+    files being reused (oversampled) across more batches than a common
+    class's files are. Total output length is capped at the same batch
+    count plain slicing would have produced (``ceil(len(entries) /
+    files_per_batch) * files_per_batch``), so this changes batch
+    *composition*, not how many batches/trees get trained.
+
+    With more distinct fault types than ``files_per_batch``, no
+    grouping — cycled or not — can put every type in EVERY single batch
+    simultaneously (11 types don't fit in a 10-file batch); which
+    type(s) a given batch misses now simply rotates rather than being
+    permanently fixed. The residual gap is what the placeholder-row
+    padding in :func:`_fit_tabular_batched` exists to cover; this
+    function reduces how often that padding is needed and how starved
+    of real signal it leaves any one class, it doesn't replace it.
+
+    Parameters
+    ----------
+    entries : list[dict]
+        Registry entries, each with a ``"fault_type"`` key.
+    files_per_batch : int
+
+    Returns
+    -------
+    list[list[dict]]
+    """
+    from collections import defaultdict
+
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for e in entries:
+        groups[e.get("fault_type", "none")].append(e)
+
+    # Sorted key order: deterministic regardless of dict insertion order.
+    ordered_groups = [g for k in sorted(groups) if (g := groups[k])]
+    if not ordered_groups or files_per_batch <= 0:
+        return [entries[i:i + files_per_batch]
+                for i in range(0, len(entries), max(files_per_batch, 1))]
+
+    n_batches  = -(-len(entries) // files_per_batch)  # ceil division
+    target_len = n_batches * files_per_batch
+
+    interleaved: list[dict] = []
+    round_idx = 0
+    while len(interleaved) < target_len:
+        for g in ordered_groups:
+            if len(interleaved) >= target_len:
+                break
+            interleaved.append(g[round_idx % len(g)])
+        round_idx += 1
+
+    return [interleaved[i:i + files_per_batch]
+            for i in range(0, len(interleaved), files_per_batch)]
+
 
 def _fit_tabular_batched(
     mode: str,
@@ -662,6 +756,18 @@ def _fit_tabular_batched(
       ``fault_type``) or left to drift batch-to-batch. If
       ``estimator_kwargs`` already specifies ``class_weight``, that's
       respected as-is instead.
+    - Class *coverage*: a separate issue from weighting above.
+      ``self.classes_``/``n_classes_`` are also derived fresh from
+      ``np.unique(y)`` on every ``fit()`` call, and a batch missing a
+      class entirely produces trees with fewer ``predict_proba`` output
+      columns than trees from a batch that saw every class —
+      ``ForestClassifier.predict_proba`` then fails averaging across
+      ``self.estimators_`` with mismatched array widths. Handled two
+      ways: batches are composed via :func:`_class_balanced_file_chunks`
+      (interleaved across ``fault_type`` instead of a plain contiguous
+      slice, so more batches see real rows of rarer types) and, as a
+      guaranteed backstop for whatever gap remains, each batch is padded
+      with one placeholder row per still-missing class before ``fit()``.
     - Evaluation (``X_te``/``y_te``) is unaffected — this only changes
       how training data is consumed. Prediction over a bounded test set
       is far cheaper than fitting 200 trees, and isn't a memory bottleneck.
@@ -680,8 +786,7 @@ def _fit_tabular_batched(
     from library.features import build_feature_matrix
     from library.models.definitions import build_model
 
-    chunks = [train_entries[i:i + files_per_batch]
-              for i in range(0, len(train_entries), files_per_batch)]
+    chunks = _class_balanced_file_chunks(train_entries, files_per_batch)
     n_chunks = len(chunks)
     if n_chunks == 0:
         return None, None, [], [], []
@@ -773,7 +878,12 @@ def _fit_tabular_batched(
             # calls feeding the same forest.
             _, used = build_feature_matrix(chunk_df, feature_cols)
             if save_deployment:
-                deploy_set = set(cfg.feature_set("scada+stress"))
+                # See the non-batched deployment variant's comment above
+                # for why this is "scada", not "scada+stress" — stress_*
+                # columns are simulation-only (BatchConfig documents them
+                # as "SOLEY-derived stress indicators"), so including them
+                # here would defeat the point of a real-SCADA-only model.
+                deploy_set = set(cfg.feature_set("scada"))
                 deploy_idx = [j for j, f in enumerate(used) if f in deploy_set]
                 deploy_feats = [used[j] for j in deploy_idx]
 
@@ -783,6 +893,35 @@ def _fit_tabular_batched(
         else:
             y_chunk = chunk_df["fault_active"].values.astype(int)
         del chunk_df
+
+        # RandomForestClassifier derives self.classes_/n_classes_ fresh
+        # from np.unique(y) on EVERY fit() call, including warm_start
+        # ones — it doesn't reconcile against classes seen by earlier
+        # batches. If this batch's files don't happen to cover every
+        # class this task has (entirely possible for a rarer fault type,
+        # even with the more class-balanced batching above — see
+        # _class_balanced_file_chunks), the trees grown THIS batch get
+        # fewer output columns than trees grown on a batch that did see
+        # every class. predict_proba then tries to average per-tree
+        # probability arrays of mismatched widths across
+        # self.estimators_ and raises — e.g. "operands could not be
+        # broadcast together with shapes (N,3) (N,8) (N,3)". One
+        # placeholder row per absent class (an existing row's features,
+        # relabelled) keeps every batch's np.unique(y) — and therefore
+        # every tree's output width — equal to the full class set. It's
+        # a shape-consistency fix, not a training-signal one: a handful
+        # of mislabelled rows out of a ~200k-row batch has no meaningful
+        # effect on the forest's real splits.
+        all_classes_arr = (np.arange(len(le.classes_)) if is_cls
+                           else np.array([0, 1]))
+        missing = np.setdiff1d(all_classes_arr, np.unique(y_chunk))
+        if len(missing) and len(X_chunk):
+            pad_idx = np.zeros(len(missing), dtype=int)
+            X_chunk = np.vstack([X_chunk, X_chunk[pad_idx]])
+            y_chunk = np.concatenate([y_chunk, missing])
+            log.info("    Padded %d class(es) absent from this batch (%s) "
+                     "with placeholder rows to keep warm_start trees "
+                     "shape-consistent", len(missing), missing.tolist())
 
         if model is None:
             model = build_model(mode, n_estimators=n_new_trees,
@@ -1597,9 +1736,11 @@ def run_task(
         convention every caller has to remember); this dict is only for
         per-estimator *hyperparameters*.
     save_deployment : bool
-        If True (default), also fit and save a SCADA+stress-only variant
+        If True (default), also fit and save a real-SCADA-only variant
         of every tabular model (works on real SCADA data with no
-        SOLEY-simulation-only device physics).
+        SOLEY-simulation-only device physics or stress indicators —
+        see :func:`_eval_save_tabular`'s comment on why this uses
+        ``cfg.feature_set("scada")`` and not ``"scada+stress"``).
     compute_shap : bool
         Opt-in gradient-attribution plot for sequence models — see
         :func:`plot_attribution`. Off by default; no effect on tabular

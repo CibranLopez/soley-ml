@@ -8,14 +8,36 @@ directory:
   * Array DC capacity (kWp) for performance-ratio computation.
   * Site coordinates and human-readable location names.
   * All available parquet columns, categorised into:
-      - scada_features   : measurable by real SCADA / monitoring systems
-      - device_features  : available only from SOLEY simulation physics
-      - stress_features  : SOLEY-derived stress indicators (stress_*)
-      - meta_cols        : indexing / splitting columns
-      - label_cols       : fault labels (fault_*)
+      - scada_features    : measurable by real SCADA / monitoring systems
+      - iv_curve_features  : real IV-curve-tracer outputs (Voc, Jsc, FF, ...) —
+                            not baseline SCADA, but a real capability on
+                            advanced/smart-grid-connected installations
+      - stress_features   : weather-derived stress indicators (stress_*) —
+                            deterministic, computed from weather data, but
+                            not currently exposed by this pipeline's SCADA
+      - meta_cols         : indexing / splitting columns
+      - label_cols        : fault labels (fault_*)
   * load_cols: the minimal set of columns to read from parquet files.
 
-Nothing is hard-coded. BatchConfig works with any SOLEY batch output.
+Column classification is DEFAULT-DENY: a column only becomes a usable
+feature if it's explicitly recognised as SCADA-measurable, an IV-curve
+output, or stress-prefixed. Everything else — including any new,
+not-yet-seen column in a future SOLEY batch — is excluded and logged as
+"uncategorized" rather than silently absorbed into a catch-all feature
+bucket. This replaced an earlier "device_features" catch-all (anything
+not otherwise classified) that had silently been including simulator-
+internal state columns — aging_factor, soiling_factor, vulnerability,
+and similar — as model inputs. These directly cause the very power
+deviations the model is meant to learn to detect from indirect,
+real-world-observable telemetry; using them as features let a model
+shortcut around learning that signal, and would have provided zero
+predictive value on a real (non-simulated) installation. Confirmed via
+the domain owner: categories 4-7 of the SOLEY schema (geometry/location
+identifiers, loss & correction factors, fault labels, and simulation
+truth/noise columns) are metadata and targets, never model inputs — see
+_SIMULATION_INTERNAL_COLS below for the specific columns this excludes.
+
+Nothing else is hard-coded. BatchConfig works with any SOLEY batch output.
 """
 
 import json
@@ -53,8 +75,20 @@ _ENGINEERED_FEATURES = (
     "performance_ratio", "pr_deviation", "dc_ac_power_ratio", "power_step",
 )
 
-# Columns that a real SCADA / monitoring system can measure directly.
-# Everything else is a "device physics" column (simulation-only).
+# Columns a real SCADA / monitoring system can measure or directly compute
+# from geometry + time (solar position and angle of incidence are standard
+# outputs of any real PV monitoring/tracking platform, not simulation
+# ground truth). Everything else needs its own explicit category below —
+# there is deliberately no catch-all "anything else is SCADA-adjacent"
+# rule; see the module docstring for why.
+#
+# NOTE: efficiency_pct is intentionally NOT included here even though it
+# sounds like a SCADA quantity — confirmed with the domain owner that real
+# monitoring systems don't report it directly (only dc/ac power, from which
+# it COULD be derived), and in this simulator it's computed by the physics
+# engine. It's classified under _IV_CURVE_COLS's spirit but doesn't fit
+# that name either, so it gets its own tiny set below rather than being
+# mis-filed into _SCADA_MEASURABLE.
 _SCADA_MEASURABLE = {
     "poa_global_wm2", "ghi_wm2", "dni_wm2", "dhi_wm2",
     "ambient_temp_c", "cell_temp_c",
@@ -64,15 +98,43 @@ _SCADA_MEASURABLE = {
     "solar_elevation_deg", "aoi_deg",
 } | set(_ENGINEERED_FEATURES)
 
-# Columns that are simulation-only "god-mode" outputs — never available in a
-# real installation and MUST NOT be used as model inputs.
-_GOD_MODE_COLS = {
-    "voc_v",
-    "jsc_a_m2",
-    "ff",
-    "vmpp_v",
-    "jmpp_a_m2",
+# Real IV-curve-tracer outputs. Not part of baseline SCADA telemetry — but
+# unlike DETAILED_BALANCE_EFFICIENCY below (a theoretical/idealized
+# quantity with no real-world sensor equivalent), periodic IV-curve tracing
+# is a real capability on modern smart-grid-connected installations. Legit
+# "full"/research-tier features; not "deployment"-tier. efficiency_pct is
+# simulator-computed (see _SCADA_MEASURABLE note above) but conceptually
+# belongs with this tier — derivable from an IV curve, not raw SCADA.
+_IV_CURVE_COLS = {
+    "voc_v", "jsc_a_m2", "ff", "vmpp_v", "jmpp_a_m2",
+    "efficiency_pct",
+}
+
+# Purely theoretical physics-engine output — a thermodynamic upper bound,
+# not something any real installation, however advanced, could measure.
+# Always excluded from every feature_set() mode.
+_THEORETICAL_ONLY_COLS = {
     "detailed_balance_efficiency_pct",
+}
+
+# Simulator-internal state / mechanism variables: the "why" behind observed
+# behavior, not something any real monitoring system reports. Confirmed
+# with the domain owner these are metadata about the generative process,
+# never training inputs, even for the research/"full" tier — using them
+# would let a model shortcut around learning the physical signal it's
+# actually supposed to infer from indirect telemetry (e.g. aging_factor /
+# soiling_factor / shading_factor directly CAUSE the power deviations a
+# fault-detection model is meant to detect from power/irradiance/temp
+# alone). vulnerability is additionally run-level (one Beta(2,5) draw per
+# simulation run, not per-row) rather than a real per-timestep signal at
+# all — the same failure mode as a leaked group/run identifier.
+_SIMULATION_INTERNAL_COLS = {
+    "soiling_factor", "aoi_correction_factor", "spectral_factor",
+    "shading_factor", "inverter_efficiency", "inverter_loss_kw",
+    "inverter_derating_factor", "snow_loss_factor", "mismatch_loss_factor",
+    "dc_wiring_loss_factor", "ac_wiring_loss_factor", "availability_factor",
+    "lid_factor", "bifacial_gain", "aging_factor",
+    "vulnerability",
 }
 
 
@@ -92,13 +154,24 @@ class BatchConfig:
     locations : dict
         ``{(lat, lon): "City, Country"}`` for every site in the batch.
     scada_features : list[str]
-        Feature columns measurable by real monitoring hardware.
-    device_features : list[str]
-        Feature columns available only from SOLEY simulation.
+        Feature columns measurable by real monitoring hardware (plus the
+        purely SCADA/timestamp-derived engineered features).
+    iv_curve_features : list[str]
+        Real IV-curve-tracer outputs (Voc, Jsc, FF, Vmpp, Jmpp,
+        efficiency_pct) — not baseline SCADA, but achievable on advanced,
+        smart-grid-connected installations that perform periodic IV
+        curves. Research/"full"-tier only, never "deployment".
     stress_features : list[str]
-        Physics-derived stress indicator columns (``stress_*``).
+        Weather-derived stress indicator columns (``stress_*``) —
+        deterministic continuous intensity values computed from weather
+        data (0 = no stress, 1.0 = at threshold, >1 = above threshold),
+        not currently exposed by this pipeline's baseline SCADA feature
+        set. Research-tier, included in "full" and "scada+stress".
     all_feature_cols : list[str]
-        Union of the three feature lists above.
+        Union of the three feature lists above. Deliberately does NOT
+        include simulator-internal columns (aging_factor, soiling_factor,
+        vulnerability, etc.) or theoretical-only columns
+        (detailed_balance_efficiency_pct) — see the module docstring.
     meta_cols : set[str]
         Metadata columns (latitude, longitude, sim_year, …).
     label_cols : set[str]
@@ -245,13 +318,14 @@ class BatchConfig:
         self.noise_cols   = _NOISE_COLS & all_cols
         self.constant_cols = constant_cols
 
-        excluded = (
+        non_feature = (
             self.meta_cols | self.label_cols | self.combo_cols
             | self.noise_cols | {"timestamp", "run_id"}
             | {c for c in all_cols if c.endswith("_true")}
-            | _GOD_MODE_COLS          # simulation-only; never available in real installs
+            | _THEORETICAL_ONLY_COLS      # no real install can ever measure these
+            | _SIMULATION_INTERNAL_COLS   # generative-process metadata, not signal
         )
-        feature_candidates = all_cols - excluded
+        feature_candidates = all_cols - non_feature
 
         self.stress_features: list[str] = sorted(
             c for c in feature_candidates
@@ -261,15 +335,40 @@ class BatchConfig:
             c for c in feature_candidates
             if c in _SCADA_MEASURABLE and c not in constant_cols
         )
-        self.device_features: list[str] = sorted(
+        self.iv_curve_features: list[str] = sorted(
             c for c in feature_candidates
-            if c not in _SCADA_MEASURABLE
-            and not c.startswith(_STRESS_PREFIX)
-            and c not in constant_cols
+            if c in _IV_CURVE_COLS and c not in constant_cols
         )
         self.all_feature_cols: list[str] = (
-            self.scada_features + self.device_features + self.stress_features
+            self.scada_features + self.iv_curve_features + self.stress_features
         )
+
+        # DEFAULT-DENY check: anything left in feature_candidates belongs to
+        # none of the three recognised categories above, so it was NEVER
+        # exposed as a feature — unlike the old design, where an unrecognised
+        # column fell through into a catch-all "device_features" bucket and
+        # was silently trained on (this is exactly how aging_factor,
+        # soiling_factor, and vulnerability ended up as model inputs before).
+        # Surfacing this list means a genuinely new, useful column in a
+        # future SOLEY batch is at worst a visible warning to triage — not a
+        # silent leak — and a genuinely internal one stays out without
+        # anyone having to notice and hand-add it to the exclusion set above.
+        categorized = (
+            set(self.scada_features) | set(self.stress_features)
+            | set(self.iv_curve_features)
+        )
+        uncategorized = feature_candidates - categorized - constant_cols
+        if uncategorized:
+            log.warning(
+                "  %d column(s) matched none of the known feature categories "
+                "and were EXCLUDED as a precaution (never silently trained "
+                "on): %s. If any of these are real, usable signals, add them "
+                "to _SCADA_MEASURABLE or _IV_CURVE_COLS in batch_config.py; "
+                "if they're simulator-internal, add them to "
+                "_SIMULATION_INTERNAL_COLS instead so this warning stops "
+                "recurring.",
+                len(uncategorized), sorted(uncategorized),
+            )
 
         # Minimal load list: features + metadata + labels
         self.load_cols: list[str] = sorted(
@@ -286,18 +385,25 @@ class BatchConfig:
             log.info("  Estimated array capacity: %.2f kWp (from max DC power)",
                      self.array_kwp)
 
-        god_mode_found = _GOD_MODE_COLS & all_cols
-        if god_mode_found:
+        theoretical_found = _THEORETICAL_ONLY_COLS & all_cols
+        internal_found    = _SIMULATION_INTERNAL_COLS & all_cols
+        if theoretical_found or internal_found:
             log.warning(
-                "  God-mode columns found in data and excluded from all feature sets: %s",
-                sorted(god_mode_found),
+                "  Simulation-only columns found in data and excluded from "
+                "all feature sets: %s (theoretical-only), %s "
+                "(simulator-internal — never a training input, even for "
+                "\"full\")",
+                sorted(theoretical_found) or "none",
+                sorted(internal_found) or "none",
             )
         log.info(
-            "  Columns: %d SCADA, %d device physics, %d stress, "
-            "%d constant (excluded), %d god-mode (excluded), %d total features",
-            len(self.scada_features), len(self.device_features),
+            "  Columns: %d SCADA, %d IV-curve, %d stress, "
+            "%d constant (excluded), %d simulation-only (excluded), "
+            "%d uncategorized (excluded), %d total features",
+            len(self.scada_features), len(self.iv_curve_features),
             len(self.stress_features), len(constant_cols),
-            len(god_mode_found), len(self.all_feature_cols),
+            len(theoretical_found) + len(internal_found), len(uncategorized),
+            len(self.all_feature_cols),
         )
 
     # ------------------------------------------------------------------
@@ -323,7 +429,34 @@ class BatchConfig:
 
         Parameters
         ----------
-        mode : {"full", "scada", "scada+stress", "scada+device"}
+        mode : {"full", "scada", "scada+stress", "scada+iv_curve"}
+            "scada"          — real-SCADA-only + purely SCADA/timestamp-
+                               derived engineered features. The deployment
+                               tier: works on any real installation's
+                               existing monitoring data, today.
+            "scada+stress"   — adds the weather-stress indicators. These
+                               ARE deterministically derivable from weather
+                               data (not simulator-internal state the way
+                               aging_factor etc. are), but this pipeline
+                               doesn't compute them for real installations
+                               today, so they stay an explicit, opt-in
+                               research variant rather than part of
+                               "scada"/deployment by default.
+            "scada+iv_curve" — adds real IV-curve-tracer outputs (Voc, Jsc,
+                               FF, Vmpp, Jmpp, efficiency_pct). Not baseline
+                               SCADA, but a real capability on advanced,
+                               smart-grid-connected installations that
+                               perform periodic IV curves.
+            "full"           — scada + stress + iv_curve: every category
+                               that's real-world-*achievable* on some
+                               installation, combined. The research/
+                               ablation tier — NOT deployment-realistic on
+                               a baseline installation. Never includes any
+                               simulator-internal-only or theoretical-only
+                               column (aging_factor, soiling_factor,
+                               vulnerability, detailed_balance_efficiency_pct,
+                               etc.) — those are excluded unconditionally,
+                               for every mode, at column-discovery time.
         """
         eng = list(_ENGINEERED_FEATURES)
         scada = list(self.scada_features) + eng
@@ -332,10 +465,20 @@ class BatchConfig:
             return scada
         if mode == "scada+stress":
             return scada + list(self.stress_features)
+        if mode == "scada+iv_curve":
+            return scada + list(self.iv_curve_features)
         if mode == "scada+device":
-            return scada + list(self.device_features)
+            log.warning(
+                '  feature_set("scada+device") is a deprecated alias — the '
+                'catch-all "device_features" category it used to mean has '
+                'been split into iv_curve_features (real, achievable on '
+                'advanced installs) and simulator-internal columns (always '
+                'excluded, see _SIMULATION_INTERNAL_COLS). Returning '
+                '"scada+iv_curve" instead.'
+            )
+            return scada + list(self.iv_curve_features)
         # full
-        return scada + list(self.device_features) + list(self.stress_features)
+        return scada + list(self.stress_features) + list(self.iv_curve_features)
 
     def __repr__(self) -> str:
         return (
