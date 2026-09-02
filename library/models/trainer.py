@@ -555,7 +555,7 @@ def _eval_save_tabular(
         plot_importance(model, feature_names, f"{task_name} — {mode.upper()}",
                         output_dir / f"importance_{tag}.png",
                         scada_features=cfg.scada_features,
-                        device_features=cfg.iv_curve_features)
+                        iv_curve_features=cfg.iv_curve_features)
 
     import joblib
     model_path = output_dir / f"model_{tag}.pkl"

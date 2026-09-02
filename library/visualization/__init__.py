@@ -122,25 +122,25 @@ def plot_importance(
     title: str,
     path: Path,
     scada_features: list[str] | None = None,
-    device_features: list[str] | None = None,
+    iv_curve_features: list[str] | None = None,
     top_n: int = 20,
 ) -> None:
     """Horizontal bar chart of RF feature importances, colour-coded by group.
 
-    Colours:  blue = SCADA,  green = device physics,  amber = stress.
+    Colours:  blue = SCADA,  green = IV curve,  amber = stress.
     """
     importances = model.feature_importances_
     top_n       = min(top_n, len(feature_names))
     indices     = np.argsort(importances)[-top_n:]
 
-    device_set = set(device_features or [])
+    iv_curve_set = set(iv_curve_features or [])
 
     colors = []
     for i in indices:
         name = feature_names[i]
         if name.startswith("stress_"):
             colors.append(_AMBER)
-        elif name in device_set:
+        elif name in iv_curve_set:
             colors.append(_GREEN)
         else:
             colors.append(_BLUE)
@@ -152,7 +152,7 @@ def plot_importance(
     ax.set_xlabel("Feature Importance (Gini)", fontsize=11)
     ax.set_title(
         f"{title} — Top {top_n} Features\n"
-        "(blue=SCADA  green=device physics  amber=stress)",
+        "(blue=SCADA  green=IV curve  amber=stress)",
         fontsize=12,
     )
     plt.tight_layout()

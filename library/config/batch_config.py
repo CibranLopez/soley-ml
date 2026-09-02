@@ -410,6 +410,27 @@ class BatchConfig:
     #  Convenience helpers
     # ------------------------------------------------------------------
 
+    @property
+    def device_features(self) -> list[str]:
+        """Deprecated alias for :attr:`iv_curve_features`.
+
+        The old ``device_features`` name referred to a broad catch-all
+        (anything not SCADA-measurable or stress-prefixed) that turned out
+        to silently include simulator-internal columns like
+        ``aging_factor`` and ``vulnerability`` as trainable features — see
+        the module docstring. That catch-all no longer exists; this
+        property exists only so an old notebook cell or script referencing
+        ``cfg.device_features`` degrades to a clear, actionable warning
+        instead of an ``AttributeError``, rather than for anyone to keep
+        using it — update callers to ``iv_curve_features`` instead.
+        """
+        log.warning(
+            '  cfg.device_features is a deprecated alias for '
+            'cfg.iv_curve_features (see its docstring) — update the '
+            'caller; this alias may be removed in future.'
+        )
+        return self.iv_curve_features
+
     def get_location_name(self, lat: float, lon: float) -> str:
         """Human-readable name for a (lat, lon) pair."""
         key = (round(lat, 2), round(lon, 2))
