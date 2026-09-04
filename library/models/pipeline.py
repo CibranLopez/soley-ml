@@ -13,7 +13,7 @@ import logging
 
 log = logging.getLogger("library")
 
-SEQUENCE_MODEL_MODES = {"mlp", "lstm", "hybrid"}
+SEQUENCE_MODEL_MODES = {"mlp", "lstm", "hybrid", "transformer"}
 TABULAR_MODEL_MODES = {"random_forest"}
 
 
@@ -58,7 +58,8 @@ def run_model_task(
         Rolling-feature window forwarded unchanged to every backend so that
         :func:`~library.data.load_registry_entry` (and therefore
         :func:`~library.features.add_features`) uses the same value for
-        every model family — RF, MLP, LSTM, and Hybrid.  Default ``12``.
+        every model family — RF, MLP, LSTM, Hybrid, and Transformer.
+        Default ``12``.
     max_train_rows, max_test_rows : int, "auto", or None
         Row caps for the tabular family, forwarded to
         :func:`~library.models.trainer.run_task`. ``"auto"`` sizes the
@@ -80,8 +81,9 @@ def run_model_task(
         test split never thinned — a redundancy cut on near-duplicate
         majority-class timesteps, not a class filter. Default ``1``: no
         thinning, identical behaviour to before this parameter existed.
-        Has no effect on sequence modes (``mlp``/``lstm``/``hybrid``),
-        which need contiguous per-file timesteps for windowing.
+        Has no effect on sequence modes (``mlp``/``lstm``/``hybrid``/
+        ``transformer``), which need contiguous per-file timesteps for
+        windowing.
     rows_per_batch, files_per_batch
         Forwarded to :func:`~library.models.trainer.run_task`. A
         *different kind of fix* from ``max_train_rows``/``"auto"``: those
@@ -92,14 +94,17 @@ def run_model_task(
         OOM kill, not a raised exception) even on an already-capped row
         count. Setting ``rows_per_batch`` switches the tabular family to
         batched training: ``train_entries`` grouped into
-        ``files_per_batch``-file batches, each loaded and used to grow
-        the forest via scikit-learn's ``warm_start`` one batch at a time,
-        so peak memory is bounded by one batch rather than the whole
-        training set. Default ``rows_per_batch=None``: batching disabled,
-        identical behaviour to before this parameter existed. Only
-        affects the tabular family (sequence models already train in
-        batches by construction) and only tabular modes supporting
-        ``warm_start`` (currently just ``"random_forest"``).
+        ``files_per_batch``-file batches (interleaved/cycled across
+        fault_type for class coverage — see
+        :func:`~library.models.trainer._class_balanced_file_chunks`),
+        each loaded and used to grow the forest via scikit-learn's
+        ``warm_start`` one batch at a time, so peak memory is bounded by
+        one batch rather than the whole training set. Default
+        ``rows_per_batch=None``: batching disabled, identical behaviour
+        to before this parameter existed. Only affects the tabular
+        family (sequence models already train in batches by
+        construction) and only tabular modes supporting ``warm_start``
+        (currently just ``"random_forest"``).
     """
     from .trainer import run_task
 
